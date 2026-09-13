@@ -1,0 +1,7 @@
+/dist/
+/obj/
+*.o
+/scratch/
+
+# addon/ ships prebuilt binaries deliberately (forceAudioIn.so, injectTone)
+# so the addon folder is ready to deploy as-is - don't ignore those.
