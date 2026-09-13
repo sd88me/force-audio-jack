@@ -1,4 +1,4 @@
-# ForceAudioIn
+# force-audioin
 
 The **shared audio-injection tap** for the Akai Force running
 [MockbaMod](https://github.com/MockbaTheBorg/MockbaMod) - a prerequisite
