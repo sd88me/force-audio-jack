@@ -109,6 +109,125 @@ typedef long snd_pcm_sframes_t;
  * trivially toggleable over SSH with no rebuild and no boot-script change. */
 #define AI_DIAG_MARKER "/tmp/forceAudioIn.diag"
 
+static void ai_log(const char *fmt, ...);   /* defined below; forward-declared for ai_dump_events */
+
+/* ---- lightweight in-process event trace (2026-09-17) --------------------
+ * Added after three separate live attempts to observe the open pads-death
+ * incident above via external strace all failed to reproduce it - the
+ * leading theory (see DESIGN.md) being that ptrace's own overhead perturbs
+ * the race enough to avoid it every single time it's attached, in any form
+ * tried so far. This replaces external tracing with self-instrumentation: a
+ * fixed-size ring of tiny event records, written with a single atomic
+ * increment and no syscalls on the hot path other than clock_gettime (which
+ * is vDSO-backed where available, and which the process would effectively
+ * need anyway) - nothing here pays for an external tracer's per-syscall
+ * context switch into and out of a separate process.
+ *
+ * Flushed to a file only on request (AI_DUMP_MARKER - same file-trigger
+ * pattern as AI_DIAG_MARKER/AI_CTOR_DELAY_MARKER below, since there's no way
+ * to reach an env var in MPC's own exec environment). Confirmed live
+ * (2026-09-17): MPC itself does NOT crash when pads go dead, it stays
+ * running, just unresponsive - so a dump can be requested well AFTER
+ * physically confirming the failure, no need to catch anything in flight. */
+#define AI_DUMP_MARKER "/tmp/forceAudioIn.dumpreq"
+#define AI_EVT_CAP     65536u   /* ring capacity, indexed mod this (power of 2) */
+
+enum {
+    AI_EVT_CTOR_START = 1,
+    AI_EVT_CTOR_DELAY,
+    AI_EVT_ATTACH_TRY,
+    AI_EVT_ATTACHED,
+    AI_EVT_REATTACHED,
+    AI_EVT_CTOR_DONE,
+    AI_EVT_THREAD_CREATED,
+    AI_EVT_HW_PARAMS,
+    AI_EVT_FIRST_READ,
+    AI_EVT_READI,     /* one per snd_pcm_readi call on the tapped handle - the "heartbeat" */
+    AI_EVT_MIX_ONE,    /* one per attached voice mixed into a given readi call */
+    AI_EVT_TRIM,
+    AI_EVT_UNDERRUN,
+    AI_EVT_BG_WAKE,
+};
+
+typedef struct {
+    uint64_t ts_ns;
+    uint32_t tid;
+    uint16_t code;
+    uint16_t d16;
+    uint32_t d32;
+} ai_evt_t;
+
+static ai_evt_t          g_evt[AI_EVT_CAP];
+static volatile uint64_t g_evt_next = 0;   /* monotonically increasing; index is this mod AI_EVT_CAP */
+
+static inline uint64_t ai_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static inline void ai_evt(uint16_t code, uint16_t d16, uint32_t d32)
+{
+    uint64_t idx = __atomic_fetch_add(&g_evt_next, 1, __ATOMIC_RELAXED) & (AI_EVT_CAP - 1);
+    ai_evt_t *e = &g_evt[idx];
+    e->ts_ns = ai_now_ns();
+    e->tid   = (uint32_t)gettid();
+    e->code  = code;
+    e->d16   = d16;
+    e->d32   = d32;
+}
+
+static const char *ai_evt_name(uint16_t code)
+{
+    switch (code) {
+        case AI_EVT_CTOR_START:     return "CTOR_START";
+        case AI_EVT_CTOR_DELAY:     return "CTOR_DELAY_MS";
+        case AI_EVT_ATTACH_TRY:     return "ATTACH_TRY_SLOT";
+        case AI_EVT_ATTACHED:       return "ATTACHED_SLOT_INO";
+        case AI_EVT_REATTACHED:     return "REATTACHED_SLOT_INO";
+        case AI_EVT_CTOR_DONE:      return "CTOR_DONE_NATTACHED";
+        case AI_EVT_THREAD_CREATED: return "BG_THREAD_CREATED";
+        case AI_EVT_HW_PARAMS:      return "HW_PARAMS_CH_RATE";
+        case AI_EVT_FIRST_READ:     return "FIRST_READ_TAP_CLAIMED";
+        case AI_EVT_READI:          return "READI_SLOT_FRAMES";
+        case AI_EVT_MIX_ONE:        return "MIX_ONE_SLOT_AVAIL";
+        case AI_EVT_TRIM:           return "TRIM_SLOT_SKIPFRAMES";
+        case AI_EVT_UNDERRUN:       return "UNDERRUN_SLOT_AVAIL";
+        case AI_EVT_BG_WAKE:        return "BG_WAKE_TICK";
+        default:                    return "?";
+    }
+}
+
+/* Dumps the ring in chronological order to a fresh timestamped-by-pid file.
+ * Only ever called from bg_main's own thread in response to AI_DUMP_MARKER -
+ * never from the hot path or a signal handler - so plain stdio is fine. */
+static void ai_dump_events(void)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/forceAudioIn.dump.%d", (int)getpid());
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    uint64_t next  = __atomic_load_n(&g_evt_next, __ATOMIC_RELAXED);
+    uint64_t count = next < AI_EVT_CAP ? next : AI_EVT_CAP;
+    uint64_t start = next < AI_EVT_CAP ? 0 : next;   /* oldest surviving slot, if the ring has wrapped */
+
+    fprintf(f, "# forceAudioIn event dump - pid %d, %llu events (capacity %u)\n",
+            (int)getpid(), (unsigned long long)count, AI_EVT_CAP);
+    fprintf(f, "# ts_ns tid event d16 d32\n");
+
+    uint64_t i;
+    for (i = 0; i < count; i++) {
+        uint64_t idx = (start + i) & (AI_EVT_CAP - 1);
+        ai_evt_t *e = &g_evt[idx];
+        fprintf(f, "%llu %u %s %u %u\n",
+                (unsigned long long)e->ts_ns, e->tid, ai_evt_name(e->code), e->d16, e->d32);
+    }
+    fclose(f);
+    ai_log("[forceAudioIn] event dump written to %s (%llu events)", path, (unsigned long long)count);
+}
+
 /* ---- originals ----------------------------------------------------------*/
 static snd_pcm_sframes_t (*orig_readi)(snd_pcm_t *, void *, snd_pcm_uframes_t);
 static snd_pcm_sframes_t (*orig_readn)(snd_pcm_t *, void **, snd_pcm_uframes_t);
@@ -261,6 +380,8 @@ static inline void ensure_init(void) { pthread_once(&g_once, ai_resolve); }
  * bounded tradeoff against ever risking a use-after-unmap there. */
 static void ai_try_attach(unsigned slot)
 {
+    ai_evt(AI_EVT_ATTACH_TRY, (uint16_t)slot, 0);
+
     char name[24];
     ai_shm_name(slot, name, sizeof(name));
 
@@ -273,6 +394,7 @@ static void ai_try_attach(unsigned slot)
     int have_stat = (stat(path, &st) == 0);
 
     ai_shm_t *cur = __atomic_load_n(&g_shm[slot], __ATOMIC_ACQUIRE);
+    int is_reattach = (cur != NULL);
     if (cur) {
         if (!have_stat || st.st_ino == g_shm_ino[slot]) return;  /* unchanged, or gone - nothing to do */
         ai_log("[forceAudioIn] voice slot %u's ring was replaced (inode %llu -> %llu) - re-attaching",
@@ -304,10 +426,11 @@ static void ai_try_attach(unsigned slot)
     g_shm_ino[slot] = st.st_ino;
     __atomic_store_n(&g_shm[slot], shm, __ATOMIC_RELEASE);
     if (!cur) __atomic_fetch_add(&g_n_attached, 1, __ATOMIC_RELAXED);
+    ai_evt(is_reattach ? AI_EVT_REATTACHED : AI_EVT_ATTACHED, (uint16_t)slot, (uint32_t)st.st_ino);
     ai_log("[forceAudioIn] voice slot %u attached: %s, %u Hz, %u ch", slot, name, shm->rate, shm->channels);
 }
 
-/* Background thread: wakes every ~2s. Two jobs, both off the hot path:
+/* Background thread: three jobs, all off the hot path:
  *   1. Lazy re-attach - retry any slot that was empty at constructor time
  *      (or still is), so a voice host started after MPC comes up gets
  *      picked up without needing another acvs restart. This is now the
@@ -315,15 +438,32 @@ static void ai_try_attach(unsigned slot)
  *      to be diagnostics-only and gated off by default (2026-09-13 open
  *      incident, see DESIGN.md); that gate now only controls job 2 below,
  *      since lazy re-attach needs this thread to always run to do its job.
+ *      Still on the original ~2s cadence (every 10th 200ms tick below).
  *   2. Diagnostics logging - unchanged from before, still gated behind
  *      AI_DIAG_MARKER so it stays off unless explicitly wanted for
- *      debugging a live session. */
+ *      debugging a live session. Same ~2s cadence as job 1.
+ *   3. Event-dump polling (2026-09-17) - checks AI_DUMP_MARKER every ~200ms,
+ *      independent of the ~2s cadence above, so a requested dump comes back
+ *      promptly rather than waiting up to 2s. This is the only reason the
+ *      sleep granularity dropped from 2s to 200ms - jobs 1/2 are unchanged
+ *      in real-world frequency, just gated by a tick counter now instead of
+ *      being the sleep duration itself. */
 static void *bg_main(void *unused)
 {
     (void)unused;
+    unsigned tick = 0;
     for (;;) {
-        struct timespec ts = {2, 0};
+        struct timespec ts = {0, 200000000L};
         nanosleep(&ts, NULL);
+        tick++;
+
+        if (access(AI_DUMP_MARKER, F_OK) == 0) {
+            ai_dump_events();
+            unlink(AI_DUMP_MARKER);
+        }
+
+        if (tick % 10 != 0) continue;   /* jobs 1/2 below stay on the original ~2s cadence */
+        ai_evt(AI_EVT_BG_WAKE, 0, tick);
 
         unsigned slot;
         for (slot = 0; slot < AI_MAX_VOICES; slot++)
@@ -403,6 +543,7 @@ static void ai_maybe_delay(void)
     }
     fclose(f);
     ai_log("[forceAudioIn] AI_CTOR_DELAY_MARKER present - delaying constructor %ldms before any attach work", ms);
+    ai_evt(AI_EVT_CTOR_DELAY, 0, (uint32_t)ms);
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
 }
@@ -410,6 +551,7 @@ static void ai_maybe_delay(void)
 __attribute__((constructor))
 static void ai_ctor(void)
 {
+    ai_evt(AI_EVT_CTOR_START, 0, 0);
     ai_maybe_delay();
     ai_log("[forceAudioIn] loaded into pid %d", (int)getpid());
 
@@ -417,6 +559,7 @@ static void ai_ctor(void)
     for (slot = 0; slot < AI_MAX_VOICES; slot++)
         ai_try_attach(slot);
     ai_log("[forceAudioIn] %u voice(s) attached at load", g_n_attached);
+    ai_evt(AI_EVT_CTOR_DONE, 0, g_n_attached);
 
     /* Unconditional, unlike before: this thread now also does lazy
      * re-attach (see ai_try_attach/bg_main above), which has to run
@@ -429,6 +572,7 @@ static void ai_ctor(void)
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_create(&t, &attr, bg_main, NULL);
     pthread_attr_destroy(&attr);
+    ai_evt(AI_EVT_THREAD_CREATED, 0, 0);
 }
 
 /* Is destination channel `c` (of `dst_channels` total) one this voice should
@@ -460,6 +604,7 @@ static inline void mix_in_one(unsigned slot, ai_shm_t *shm, unsigned char *buffe
     uint32_t head = __atomic_load_n(&shm->head, __ATOMIC_ACQUIRE);
     uint32_t tail = shm->tail;                          /* we are the only consumer */
     uint32_t avail = (head - tail) & (AI_RING_FRAMES - 1);
+    ai_evt(AI_EVT_MIX_ONE, (uint16_t)slot, avail);
 
     /* Bound latency: a live-audio producer (e.g. maze_host) necessarily
      * starts filling this ring before MPC's process - and therefore this
@@ -476,12 +621,14 @@ static inline void mix_in_one(unsigned slot, ai_shm_t *shm, unsigned char *buffe
         avail = AI_LATENCY_TARGET_FRAMES;
         g_trim_events[slot]++;
         g_trim_frames[slot] += skip;
+        ai_evt(AI_EVT_TRIM, (uint16_t)slot, skip);
     }
 
     uint32_t take = (uint32_t)frames;
     if (take > avail) {
         shm->underruns++;
         take = avail;                                   /* mix what we have, then stop */
+        ai_evt(AI_EVT_UNDERRUN, (uint16_t)slot, avail);
     }
     if (!take) return;
 
@@ -568,6 +715,7 @@ int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
             }
             ai_log("[forceAudioIn] configured capture %s: %u Hz, %u ch, fmt %d (%u B/frame)",
                    (q_pcm_name && pcm) ? q_pcm_name(pcm) : "?", rate, ch, fmt, ch * width_of(fmt));
+            ai_evt(AI_EVT_HW_PARAMS, (uint16_t)ch, rate);
         }
     }
     return r;
@@ -589,9 +737,11 @@ snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t 
         if (!g_tap_pcm) {
             g_tap_pcm = (void *)pcm;
             g_announce_claim = 1;
+            ai_evt(AI_EVT_FIRST_READ, (uint16_t)slot, (uint32_t)r);
         }
         if ((void *)pcm != g_tap_pcm) return r;          /* a second handle - ignore it */
 
+        ai_evt(AI_EVT_READI, (uint16_t)slot, (uint32_t)r);
         mix_in((unsigned char *)buffer, (size_t)r,
                g_caps[slot].channels, g_caps[slot].frame_bytes, g_caps[slot].format);
     }

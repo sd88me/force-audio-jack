@@ -138,6 +138,18 @@ running.
   restart investigation) and the `mockbamod-module-creator` skill's
   `references/audio-injection.md` for the consuming-addon's-eye view.
 
+## Diagnostics (in-process event trace)
+
+Added while investigating the still-open pads-dead-on-restart incident (see
+DESIGN.md -- external `strace` perturbed the race away every time, so the
+tap now records its own events): a fixed-size ring of tiny event records is
+written with an atomic increment on the hot path. `touch
+/tmp/forceAudioIn.dumpreq` on the device makes the background thread dump
+the ring, in order, to `/tmp/forceAudioIn.dump.<pid>` (and delete the
+marker). MPC does not crash when pads die -- it stays up, unresponsive -- so
+a dump can be requested well after the failure. Nothing is written unless
+the marker exists. The root cause of the incident is **not** yet found.
+
 ## License
 
 No upstream license constraints (unlike `force-maze`/`force-acid`, which

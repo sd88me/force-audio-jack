@@ -327,6 +327,264 @@ where no consumer exists. Likely cause of audio-quality glitches, not
 input-handling symptoms like dead pads, so not believed to explain this
 incident.
 
+### First live attempt at the flagged `strace` capture (2026-09-17) - inconclusive, methodology fixed for next time
+
+Followed up on the "capture what happens differently during a failing vs.
+clean restart" idea above. Result: one more confirmed pads-death on a
+voice-attached restart (consistent with every prior test), but the actual
+trace data is unusable - contaminated by a self-inflicted resource issue,
+not the mechanism under investigation. Recording the gotchas so the next
+attempt doesn't repeat them.
+
+**Technique used**: a temporary systemd drop-in
+(`/etc/systemd/system/acvs.service.d/strace.conf`) wrapping `acvs.service`'s
+`ExecStart` in `strace -f -tt -o <file>`, same reversible-`/etc`-change
+pattern as the existing connman override. Removed after each capture.
+
+**Gotcha 1 - `ExecStart=strace ... PROG` makes strace itself the tracked
+unit process.** Killing strace to detach after the capture window looks
+exactly like the service dying to systemd, which immediately respawned it
+under `Restart=always` - an unplanned second `acvs` restart (with a voice
+still attached) with nobody having confirmed pads first. **Fix: `strace
+-D`** (run tracer as a detached grandchild) - this keeps the actual traced
+program as systemd's Main PID throughout, so killing the detached strace
+process afterward is inert from systemd's point of view no matter what
+state it's in. Confirmed working: `NRestarts=0` on a capture that used `-D`,
+vs. the phantom restart on the one that didn't.
+
+**Gotcha 2 - `/tmp` is tmpfs with only ~1GB, and a full-boot `strace -f`
+trace is enormous.** A single baseline capture (boot.sh's AddOns cycle +
+MPC startup, ~15s) produced a 752MB trace file. Three captures in a row
+filled tmpfs to 100%, and the next capture attempt (the voice-attached one -
+the one that actually mattered) got only 12KB before hitting `ENOSPC` on the
+trace file itself. Worse: **MPC's own startup hit `ENOSPC`** trying to write
+its own temp file (`/tmp/.com.akaipro.mpc_temp*.vcs-version`) at the same
+time - meaning that specific restart's MPC startup was genuinely
+resource-starved by the test methodology itself, independent of whatever
+the real pads-killing mechanism is. Pads did die on that restart, but this
+confound means it can't be attributed to the original unidentified
+mechanism vs. simply "startup corrupted by disk-full." **Next attempt needs
+either a scoped trace** (`-e trace=` filtering to a narrower syscall set -
+the full unfiltered trace is what makes 15s balloon to hundreds of MB) **or
+a destination off tmpfs** (the SD card has more room, but its write speed
+becomes its own timing confound, so filtering is probably the better fix).
+
+**Gotcha 3 - other addons' own voice engines can already be running and
+get swept into an `acvs` restart unexpectedly.** `force-acid`, `dx7_host`,
+and `jv_host` were all found running (leftover from separate, unrelated
+addon testing earlier the same day) and their rings auto-attached on
+restarts intended to be clean zero-voice baselines - twice, before this was
+caught. None of these addons' own *boot* scripts start them (confirmed by
+reading `run_dx7_web.sh`/`run_jv880_web.sh` - they only start the web
+panels); they were simply left running as background processes from earlier
+manual/nodeServer-toggle testing, which persist across `acvs` restarts by
+design (same reason `injectTone` does) and get lazily/constructor-time
+re-attached the moment a ring they left behind is found. **Before any
+"clean baseline" restart test: check for every known voice-producer
+process** (`maze_host`, `injectTone`, `force-acid`, `dx7_host`, `jv_host`,
+...), not just the one addon you think you're testing, and clear
+`/dev/shm/forceAudioInject*` explicitly - a producer's death (even `kill
+-9`) does not delete its ring file, and `forceAudioIn.so`'s constructor
+attaches based on the ring *file* existing, not on a live producer being
+behind it.
+
+**Net result**: zero valid paired baseline-vs-voice-attached traces exist
+yet. One clean zero-voice baseline trace was captured successfully
+(`-D`-mode, `NRestarts=0`, confirmed 0 voices at load, pads/wifi fine) but
+was deleted along with the others when clearing the full tmpfs, since its
+voice-attached counterpart was unusable and there was nothing to diff it
+against. Re-run both halves fresh next time, with `-e trace=` filtering
+from the start.
+
+### Second live attempt, same session - scoped trace works, but surfaced a worse problem: `strace -f` perturbs the boot sequence itself
+
+Fixed gotcha 2 above: `strace 4.10` on this device predates the `%group`
+shortcut syntax, so the filter has to be spelled out as explicit syscall
+names - `clone,fork,vfork,execve,exit,exit_group,wait4,mmap2,munmap,
+mprotect,brk,rt_sigaction,rt_sigprocmask,rt_sigreturn,kill,tgkill,futex,
+ioctl` (verified against `strace -e trace=... -f true` first). Effective:
+a baseline capture dropped from 752MB/215K lines (unfiltered) to
+14.4MB/89K lines (scoped) - roughly 50x smaller, tmpfs stayed under 2%
+used per capture.
+
+With that fixed, ran a real paired test: clean zero-voice baseline (pads/
+wifi fine, trace complete and comparable in size to the voice-attached
+run - no truncation this time), then attached `injectTone` (slot 1) and
+ran the voice-attached restart. **Pads survived** - but this is NOT
+evidence of anything, for a reason worse than a simple inconclusive
+result: checking `/proc/<mpc-pid>/maps` on the resulting process showed
+**`forceAudioIn.so` wasn't loaded into MPC at all** for that restart
+(`mockbaMagic.so` and `tkgl_anyctrl_lt.so` both were, confirmed 4 map
+entries each, normal). The tap literally wasn't armed, so of course
+nothing broke - this run tested nothing.
+
+**Root cause, confirmed via `boot.log` and the live `/dev/shm/.LD_PRELOAD`
+file**: the file's *final* content was correct (all three libraries
+listed) - the corruption wasn't in the file, it was in *when* `boot.sh`
+read it. `boot.sh` backgrounds every top-level `AddOns/*.sh` script
+(including `run_ForceAudioIn.sh`, `run_mockbaMagic.sh`, `run_midiloop.sh` -
+the three that read-modify-write the shared LD_PRELOAD file under the
+`mkdir` lock from the earlier boot-race fix) and then reads the file into
+`LD_PRELOAD` after a **fixed ~1s `sleep`**, with no wait for those
+background scripts to actually finish. `strace -f` traces the *entire*
+forked tree, not just MPC - meaning every one of those addon scripts was
+also running under ptrace overhead. That was apparently enough to push
+`run_ForceAudioIn.sh`'s locked write past boot.sh's fixed 1s read window,
+so `boot.sh` read the file while it still only had the other two entries.
+
+**This is a real, previously-unknown gap**, distinct from the original
+lost-update race the `mkdir` lock already fixed: the lock guarantees
+writes don't corrupt each other, but nothing guarantees all writers finish
+before boot.sh's *fixed-duration* read. Under normal (untraced) boot load
+the 1s margin has apparently always been enough - but it's a real timing
+assumption, not a proven bound, and this session is proof it can be blown
+by anything that measurably slows the addon scripts down. Not yet known
+whether this can happen without artificial tracing overhead (e.g. under
+heavy real-world CPU load from other addons at boot) - worth keeping in
+mind, separate from the pads-death incident.
+
+**Conclusion for the `strace`-based approach specifically**: whole-tree
+`strace -f` is not currently a safe/valid tool for this investigation.
+It has now shown two separate ways to invalidate its own test: (1) adding
+enough scheduling perturbation to plausibly mask the very race being
+measured (consistent with the one earlier accidental pass noted above -
+this was the *second* consecutive voice-attached run under strace to
+avoid killing pads, out of only two attempts, which is suggestive but not
+proof with n=2), and (2) perturbing unrelated boot-time timing margins
+badly enough to silently disable the addon under test.
+
+### Third live attempt, same session - late-attach fixes the methodology, still no failing trace
+
+Built `strace_mpc_late_attach.sh`: instead of wrapping the whole
+`az01-launch-MPC`/`boot.sh`/addon-script tree in strace from the start,
+`acvs` restarts completely untraced (normal boot timing, so the LD_PRELOAD
+timing-margin issue above can't recur - confirmed: all three libraries
+loaded correctly on both runs this way), then a tight poll loop
+(`ps | grep '/usr/bin/MPC'`) detects the new MPC pid and `strace -p`
+attaches directly to just that process. This follows only MPC's own
+threads, never touches the addon-script tree, and should add
+substantially less scheduling perturbation than tracing everything.
+
+Ran the same paired test: clean zero-voice baseline (pads/wifi fine,
+56K-line trace), then `injectTone` attached (slot 1) and a voice-attached
+restart under late-attach trace - this time genuinely valid (confirmed:
+all 3 libraries loaded, voice slot 1 genuinely attached, 47K-line trace,
+no tmpfs pressure). **Pads survived again.**
+
+**This is now three attempts, one clear pattern**: every methodologically
+*valid* traced attempt (whole-tree scoped, and now late-attach) has failed
+to reproduce the pads-death - only the one contaminated attempt (tmpfs-
+starved MPC startup, not a clean measurement of anything) coincided with
+an actual failure. Combined with the original accidental untraced pass
+noted in the main incident writeup above (which coincided with incidental
+extra CPU/scheduling activity from an unrelated concurrent `ps`-polling
+loop), the evidence now points at **any added scheduling perturbation
+around MPC's startup - not just heavy whole-tree tracing specifically -
+correlating with survival**. That's consistent with a race whose failing
+window is narrow enough that ptrace's overhead (even scoped to one
+process) reliably nudges it past the danger point, which would mean
+**`strace` in any form may be structurally unable to observe this bug
+happening** - not just an implementation detail to fix, but a real limit
+of ptrace-based tracing for this specific race.
+
+**Recommended next step, if this is picked back up**: stop trying to
+external-trace this and instead instrument `forceAudioIn.c`'s own hot
+path directly - a small in-process ring buffer of timestamped event codes
+(constructor entry/exit, attach/detach, backlog-trim events, read-loop
+iteration counts), written with plain memory stores, flushed to a file
+only *after* the fact (e.g. on a signal handler or the next successful
+read) rather than synchronously per-event. This adds a few cycles per
+call instead of a full ptrace trap per syscall, and might be light enough
+to not perturb the race the way any external tracer has three times
+running now. This is a code change + rebuild + redeploy, not a live-SSH
+task - natural to pick up as its own session.
+
+Recovered to the shipped baseline (zero voices, all three libraries
+confirmed loaded, pads/wifi confirmed fine) after every incident this
+session; device left clean, no stray processes, no systemd overrides,
+`/tmp` empty.
+
+### Fourth attempt, same session - self-instrumentation instead of external tracing
+
+Since every external-tracer approach above had shown signs of perturbing
+the very race being measured, built a lightweight in-process alternative
+directly into `forceAudioIn.c`: a fixed-size ring of 65536 tiny event
+records (`ai_evt_t` - timestamp, tid, event code, two small payload
+fields), written with a single relaxed atomic increment and a
+`clock_gettime(CLOCK_MONOTONIC)` call - no locks, no syscalls beyond the
+clock read, on the hot path. Instrumented: constructor start/delay/done,
+every attach/re-attach attempt and success, background-thread wake,
+`hw_params` configuration, first-read tap-claim, every `snd_pcm_readi`
+call on the tapped handle, every per-voice `mix_in_one` call (backlog
+value), every trim and underrun. Flushed to `/tmp/forceAudioIn.dump.<pid>`
+only on request, via a marker file (`AI_DUMP_MARKER`) polled every ~200ms
+from the existing background thread (its sleep granularity dropped from a
+flat 2s to 200ms for this, with the pre-existing lazy-reattach/diagnostics
+jobs now gated to every 10th tick to keep their real-world cadence
+unchanged). Since MPC itself does not crash when pads die (confirmed
+live - the process keeps running, just unresponsive), a dump can be
+requested well after physically confirming a failure, with no need to
+catch anything in flight.
+
+Built with `zig cc -target arm-linux-gnueabihf.2.39` (clean, zero warnings
+even under `-Wall -Wextra`), deployed alongside a backup of the original
+binary (`forceAudioIn.so.bak-preinstrument`) so the comparison below was
+possible. Verified working end-to-end: dump mechanism responds within
+~2s, event timeline correctly shows the constructor sequence, background
+thread wakes, and a clean ~2.9ms `snd_pcm_readi` cadence (128 frames @
+44100Hz, exactly right) once running.
+
+**Result: eight consecutive `acvs` restarts with a voice attached, zero
+failures** - including one deliberately run with the ORIGINAL,
+completely un-instrumented binary restored (backed up before this
+session's changes), specifically to test whether even this self-
+instrumentation's much lighter overhead was itself enough to avoid the
+race the way external tracing seemed to. That run passed too, which
+weakens "any added overhead masks it" as the *complete* explanation -
+if literally the original bytes-for-bytes pre-existing binary also passes
+repeatedly now, something besides instrumentation overhead has changed
+since the incident was first characterized as "100%-reproducible, no
+cushion" on 2026-09-13.
+
+**The likely real explanation, previously unseparated**: every test
+across this entire investigation (2026-09-13 through tonight) that
+successfully attached a voice used `injectTone` - this project's own
+minimal, single-threaded test producer. The *original* incident was
+discovered and confirmed using `force-maze`'s `maze_host` - a real synth
+engine with its own RtMidi virtual MIDI client and rendering thread(s).
+DESIGN.md's own elimination sequence already flagged this as one of two
+undistinguished remaining suspects: "the ring bookkeeping/atomics/
+backlog-trim path... or... something about the separate voice-host
+PROCESS itself (maze_host's own threads/RtMidi client) - not yet
+distinguished from each other." Tonight's eight straight passes, all with
+`injectTone`, are consistent with the ring-bookkeeping/atomics path
+(inside forceAudioIn.so itself, exercised identically regardless of which
+producer feeds it) simply not being the culprit - while `maze_host`'s own
+process-level behavior, never tested tonight, remains completely
+untested. **This is the single highest-value next experiment**: repeat
+this exact protocol (instrumented `forceAudioIn.so` now already deployed,
+zero-voice baseline proven safe, dump-on-request working) but attach
+`force-maze`'s `maze_host` instead of `injectTone`.
+
+**Side finding, confirmed real** (not the pads mystery, but real and
+actionable): the event dump from the first voice-attached restart showed
+13069 of 13103 `mix_in_one` calls (99.7%) hitting the underrun path
+despite `injectTone` having produced continuously through the ~8s restart
+gap - strong evidence the "unconfirmed" ring-aliasing bug DESIGN.md
+already flagged (`avail = (head - tail) & (AI_RING_FRAMES - 1)` aliasing
+when true backlog exceeds one full lap, ~1.49s) is real and gets triggered
+by exactly this scenario (a producer that keeps rendering across a
+multi-second `acvs` restart gap). Not fixed yet - parked alongside the
+main incident - but no longer "unconfirmed."
+
+**Current shipped state**: the instrumented `forceAudioIn.so` is now the
+one installed on the device (proven safe across nine total restarts this
+session, zero-voice and voice-attached both), replacing the pre-
+instrumentation binary as the working baseline. A backup of the original
+(`forceAudioIn.so.bak-preinstrument`) is left alongside it on the card.
+Source changes are in this repo's `src/forceAudioIn.c` (not yet
+committed as of this session).
+
 ## Shipped baseline: zero-voices-at-boot + on-demand start (2026-09-13)
 
 Rather than block a usable setup on finding the root cause above, shipped
@@ -391,6 +649,24 @@ means re-running the same live experiment multiple times.
 
 ## Not yet built
 
-- Root cause of the open pads/buttons incident above.
+- Root cause of the open pads/buttons incident above. Four live attempts
+  this session (three external-tracer variants, one self-instrumented)
+  all failed to reproduce it - eight straight passes with a voice
+  attached, including with the original un-instrumented binary. See the
+  self-instrumentation section above for the likely reason: every test
+  used `injectTone` (simple, single-threaded), never `maze_host` (a real
+  synth with its own RtMidi client/threads) - the two were never
+  separated as variables until now.
+- **Highest-value next step**: repeat the same protocol with `force-
+  maze`'s `maze_host` attached instead of `injectTone`. The instrumented
+  `forceAudioIn.so` is already deployed and proven working (dump-on-
+  request via `AI_DUMP_MARKER`, verified end-to-end) - no more tooling
+  needed, just the live test itself, with a human physically present to
+  check pads immediately after each restart.
+- Fix for the confirmed (no longer "unconfirmed") ring-aliasing underrun
+  bug - `avail`'s modular arithmetic aliases when true backlog exceeds one
+  full ring lap (~1.49s), confirmed via this session's event dump (99.7%
+  underrun rate after an ~8s restart gap with a producer still rendering).
+  Likely an audio-quality issue, not related to the pads incident.
 - A proper regression test that exercises the actual `acvs`-restart-while-
   attached failure mode, if one is ever found that's safe to automate.
