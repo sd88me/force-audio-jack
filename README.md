@@ -1,157 +1,315 @@
 # force-audioin
 
-The **shared audio-injection tap** for the Akai Force running
-[MockbaMod](https://github.com/MockbaTheBorg/MockbaMod) - a prerequisite
-addon, not a synth in its own right. It injects synthesized/generated audio
-into the Force's own audio-in capture path, so a separate process's output
-becomes audible on a normal Audio-In track - the inverse of the
-`ForceLinkAudio` addon (which taps `snd_pcm_writei` to extract what the
-Force plays; this taps `snd_pcm_readi` to inject audio into what it
-captures).
+**A shared audio-injection tap for the Akai Force — the prerequisite
+add-on that lets a background synth or generator process appear as
+live signal on a real Audio-In track, with no hardware loopback
+cable.**
 
-Other addons that want to inject audio - [`force-maze`](https://github.com/sd88me/force-maze)'s
-`ForceMazeVoice`, and any future ones - depend on this addon being enabled.
-They don't bundle their own copy of `forceAudioIn.so` or arm `LD_PRELOAD`
-themselves; they just attach to the tap this addon arms. See
-`~/.claude/skills/mockbamod-module-creator`'s `references/audio-injection.md`
-for the full design story from the consuming side, and this repo's own
-[DESIGN.md](DESIGN.md) for the tap's own architecture and incident history.
+force-audioin is not a synth or sequencer in its own right — it makes
+no sound by itself. It's the shared, always-on tap that other
+add-ons (Maze Voice, and any future voice-producing add-on) inject
+their own rendered audio through.
 
-This repo is the source for what ships pre-built in the
-[`sd88me/MockbaMod`](https://github.com/sd88me/MockbaMod) fork at
-`SD/AddOns/ForceAudioIn` - that tree is the deploy target (bundled directly
-into the fork's SD image since so many addons depend on it), this repo is
-where `forceAudioIn.c`/`injectTone.c` are actually developed, built, and
-tested. Originally split out of `force-maze` (2026-09-13), which built this
-into its own `addon/` as a staging output before manually copying it to the
-fork - see `force-maze`'s git history (`scripts/build_audiotap.sh`) for
-that prior arrangement.
+**Status: v1.0 — stable release**, running on real Force hardware.
+This document is the install/usage manual. For internals and the full
+technical design, see [DESIGN.md](DESIGN.md).
 
-## How it works
+---
 
-```
-your synth/generator process (any language/toolchain, e.g. force-maze's maze_host)
-        │  renders audio, writes into a POSIX shared-memory ring
-        ▼
-forceAudioIn.so (LD_PRELOAD'd into /usr/bin/MPC)
-        │  interposes snd_pcm_readi by symbol name (dlsym(RTLD_NEXT, ...)) -
-        │  not raw address patching, so no firmware-version dependency.
-        │  mixes (sums, never replaces) up to 4 simultaneous voice rings
-        │  into whatever real hardware audio MPC reads, so a real
-        │  instrument on the physical input keeps working unmodified.
-        ▼
-Audio-In track on the Force
-```
+## Table of contents
 
-`forceAudioInject.h` is the reusable shared-memory ring layout (magic,
-sample rate, channel count, head/tail indices, the sample buffer) -
-handles the SPSC (single-producer/single-consumer) atomics for one producer
-process and one consumer thread inside `MPC`. Every voice-producing addon
-that wants to attach vendors a copy of this exact header (`force-maze`'s
-`src/forceAudioInject.h` is one) - it's the ABI contract between producer
-and tap, so any copy must stay byte-for-byte identical to this repo's.
+- [What is the audio-injection tap?](#what-is-the-audio-injection-tap)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Using force-audioin](#using-force-audioin)
+- [The hard rule](#the-hard-rule)
+- [Building from source](#building-from-source)
+- [Testing](#testing)
+- [Diagnostics](#diagnostics)
+- [Troubleshooting](#troubleshooting)
+- [Project layout](#project-layout)
+- [Related projects & credits](#related-projects--credits)
+- [License](#license)
 
-`injectTone.c` is a minimal stand-in producer (a fixed sine wave), started
-on demand from the nodeServer Modules page (`/moduler`) - useful to prove
-the injection path works before wiring up a real DSP engine. A real voice
-host (like `force-maze`'s `maze_host`) replaces it, writing rendered audio
-into its own slot's ring instead.
+---
 
-## Layout
+## What is the audio-injection tap?
 
-```
-src/
-  forceAudioIn.c          LD_PRELOAD tap: mixes voice rings into MPC's capture reads
-  injectTone.c            fixed-tone test producer (smoke-test only)
-  forceAudioInject.h      shared-memory ring layout - the producer/consumer ABI contract
-addon/                  MockbaMod addon: manage.sh, run_ForceAudioIn.sh (autostart hook,
-                        arms the tap only - zero voices ever attached at boot),
-                        NSMODULE.json (nodeServer Modules-page entry for injectTone)
-scripts/
-  build.sh                zig cross-build (no Docker needed - see script header)
-tests/
-  test_mix.c              native unit test against the REAL forceAudioIn.c mixing/
-                          attach code (#includes it directly - not a reimplementation)
-  run.sh                  builds and runs test_mix.c natively, host-arch, no device needed
-```
+The Force's own application (MPC) opens its audio codec directly and
+holds both playback and capture exclusively — there's no JACK server,
+no ALSA loopback device, and no software mixer sitting in between.
+That's a real problem for any add-on that wants to render its own
+audio in a separate background process (rather than as a plugin
+inside MPC itself): there's no supported way for that audio to reach
+a real Audio-In track.
 
-## Build
+**force-audioin solves this by mixing injected audio directly into
+what MPC itself reads from its own capture device**, live, in real
+time — no cable, no hardware loopback, no change to how MPC's Audio-In
+track behaves. A separate process (Maze Voice's `maze_host`, or this
+add-on's own test tone generator, `injectTone`) renders audio into a
+small shared-memory ring buffer; force-audioin's tap reads from that
+ring and adds it directly into MPC's own captured audio, sample by
+sample, on the real audio thread. A real instrument plugged into the
+physical input keeps working completely unmodified alongside whatever
+gets injected.
 
-```bash
-ZIG=/path/to/zig ./scripts/build.sh
-```
+This is the audio equivalent of a separate add-on in this family,
+[force-shadow](https://github.com/sd88me/force-shadow), which does the
+same kind of thing for the screen and touchscreen instead of audio —
+both exist to give a background process a real, native-feeling
+integration point with the Force's own hardware, without changing
+anything about how MPC itself works.
 
-Writes `addon/forceAudioIn.so` and `addon/injectTone`, ready to deploy as-is.
+force-audioin is the mirror image of
+**[force-link-audio](https://github.com/macdigi/force-link-audio)**, an
+add-on by [macdigi](https://github.com/macdigi) that taps the *output*
+side (`snd_pcm_writei`) to extract what the Force is playing; this
+add-on taps the *input* side (`snd_pcm_readi`) to inject audio into
+what it captures. force-link-audio's own interposition approach was
+the reference point this add-on's design started from.
 
-## Test
+## Features
 
-```bash
-./tests/run.sh
-```
+- **Real Audio-In signal, no hardware loopback.** Injected audio
+  appears on a normal Audio-In track exactly as if it were coming from
+  a physical input — no cable, no extra audio interface.
+- **Up to 4 simultaneous voices.** Multiple add-ons (or multiple
+  instances) can each inject their own independent audio stream at
+  once, mixed together automatically.
+- **Per-voice volume, mute, and L/R/L+R routing** — controlled
+  directly by each voice's own control socket, with no separate
+  central mixer to configure.
+- **Real instruments keep working.** Injection is purely additive: a
+  real instrument on the physical audio input is never touched or
+  replaced.
+- **Starts on demand, not at boot.** force-audioin itself arms at boot
+  with **zero voices ever attached** — a voice-producing process is
+  only ever started later, on demand, from the Force's own nodeServer
+  Modules page.
+- **Picks up a new voice live, no restart needed.** A background
+  thread checks for new (or replaced) voice rings roughly every 2
+  seconds, so starting a voice's process is all that's needed — no
+  reboot, no add-on restart.
+- **Fails safe, always.** Missing shared memory for a given voice slot
+  is not an error — that slot is simply not attached yet, and normal
+  capture continues completely unaffected. Any other failure degrades
+  the same way: real captured audio always passes through untouched.
+- **No extra runtime dependencies on the Force.** Links against
+  exactly `libasound`/`libpthread`/`librt` — nothing else to install
+  on-device.
+- **Includes a built-in test signal.** `injectTone`, a minimal sine
+  wave generator, proves the whole injection path works before ever
+  wiring up a real synth.
 
-Native, host-arch, no device or Docker needed - see `tests/test_mix.c`'s own
-header comment for exactly what this can and can't validate (the mixing/
-attach logic, not the real ALSA interposition itself).
+## Requirements
 
-## Deploy / enable
+- An Akai Force running
+  [MockbaMod](https://github.com/MockbaTheBorg/MockbaMod) — force-audioin
+  is installed as a MockbaMod add-on.
+- SSH access to the device for installation.
+- No other software to install on the Force itself.
+- Any add-on that wants to inject audio (e.g.
+  [force-maze](https://github.com/sd88me/force-maze)'s Maze Voice) needs
+  this add-on installed and enabled first — they don't bundle their own
+  copy of the tap.
 
-```
-ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceAudioIn'   # see note below
-scp -r addon root@<force-ip>:/media/<serial>/AddOns/ForceAudioIn
-ssh root@<force-ip> '/media/<serial>/AddOns/ForceAudioIn/manage.sh ENABLE'
-```
+## Installation
 
-`scp -r addon dest` copies `addon` itself as a subdirectory of `dest` if
-`dest` already exists (`dest/addon/...`) rather than merging its contents
-into `dest` - the `rm -rf` first avoids that (safe to skip only when
-deploying to a path that doesn't exist yet).
+1. **Copy the add-on onto the device**, replacing any previous copy
+   (`scp -r` copies `addon` *into* an existing destination rather than
+   replacing it, so remove any old copy first):
+   ```
+   ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceAudioIn'
+   scp -r addon root@<force-ip>:/media/<serial>/AddOns/ForceAudioIn
+   ```
+2. **Enable it:**
+   ```
+   ssh root@<force-ip> '/media/<serial>/AddOns/ForceAudioIn/manage.sh ENABLE'
+   ```
+   This arms the tap at boot with **zero voices ever attached** — it
+   does not start `injectTone` or any other producer by itself. This
+   behaviour has been proven safe across repeated restarts and a real
+   physical reboot.
+3. **Restart the Force** (or `systemctl restart acvs`) so the add-on
+   is picked up — safe to do at this point, since no voice is attached
+   yet (see [The hard rule](#the-hard-rule) below for why this matters).
 
-`manage.sh ENABLE` arms the tap at boot with **zero voices ever attached** -
-proven safe across every repeated-restart test run against it, including a
-real physical reboot. It does not start `injectTone` or any other producer.
-Start/stop a voice from the nodeServer Modules page instead, whenever you
-actually want one running - never by editing this addon's own scripts.
+That's it — the tap is now armed. Nothing is audible or different in
+normal use until a voice is actually started (see below).
 
-Logs: `/tmp/forceAudioIn.log` (the shared tap).
+To remove or disable the add-on later, use `manage.sh`'s own commands
+— it follows the same convention as other MockbaMod add-ons in this
+family (see `manage.sh`'s own usage output on the device for the exact
+options available).
+
+## Using force-audioin
+
+**Starting a voice:** open the Force's own nodeServer Modules page
+(`/moduler`) and start the voice-producing process you want — this
+add-on's own `injectTone` (a fixed test tone, useful for confirming
+everything works), or a real synth like Maze Voice's `maze_host`. The
+background re-attach thread picks up the new voice's shared-memory
+ring within about 2 seconds — no restart needed, and no further action
+required. Once attached, its audio is mixed live into the Audio-In
+track.
+
+**Stopping a voice:** stop it from the same Modules page toggle. This
+does a clean process kill with no `acvs` restart involved.
+
+**Adjusting a voice's volume, mute, or L/R routing:** these are
+controlled directly by that voice's own control socket (e.g. Maze
+Voice's own on-screen or web controls) — force-audioin itself has no
+separate mixer page of its own.
 
 ## The hard rule
 
-**Never restart `acvs` while any voice is attached.** Extensive live
-testing found that doing so reliably kills pads/buttons (occasionally
-wifi) - on the very first restart, not gradually. The mechanism is still
-unidentified despite ruling out symbol collision, a background diagnostics
-thread, the per-sample mix loop itself, and both co-loaded libraries'
-constructors (confirmed inert via disassembly) - see [DESIGN.md](DESIGN.md)
-for the full investigation. `forceAudioIn.so` armed with zero voices, by
-contrast, has never failed a single test. So: enable this addon once (arms
-the tap, persists across boots, zero voices), then only ever start/stop
-voices via the Modules page, and never restart `acvs` manually while one is
-running.
+**Never restart `acvs` while any voice is attached.**
 
-## Notes
+Extensive live testing found that doing so can reliably kill
+pads/buttons (occasionally Wi-Fi) — on the very first restart, not
+gradually — while force-audioin is armed with a voice actually
+attached. With **zero** voices attached, by contrast, `acvs` restarts
+(and full physical reboots) have never failed a single test.
 
-- Multiple simultaneous voices from different addons are supported and
-  intentional (each takes its own `--slot` 0-3).
-- See [DESIGN.md](DESIGN.md) for the full design story (clock-rate
-  handling, the boot-race constraint, why this class of `LD_PRELOAD` use is
-  lower-risk than raw binary patching, and the still-open pads-dead-on-
-  restart investigation) and the `mockbamod-module-creator` skill's
-  `references/audio-injection.md` for the consuming-addon's-eye view.
+This is why voices are always started via the Modules page rather than
+at boot: that path never touches `acvs` at all, so it can never
+trigger this. In everyday use, this only matters if you're doing your
+own device-level maintenance:
 
-## Diagnostics (in-process event trace)
+- **Before restarting `acvs` or rebooting for any other reason, stop
+  every running voice first** (via the Modules page), then restart.
+- This add-on being *enabled* is always safe on its own, at any time,
+  including across a real reboot — the risk is specifically tied to a
+  voice being actively attached during the restart itself, not to the
+  add-on being armed.
 
-Added while investigating the still-open pads-dead-on-restart incident (see
-DESIGN.md -- external `strace` perturbed the race away every time, so the
-tap now records its own events): a fixed-size ring of tiny event records is
-written with an atomic increment on the hot path. `touch
-/tmp/forceAudioIn.dumpreq` on the device makes the background thread dump
-the ring, in order, to `/tmp/forceAudioIn.dump.<pid>` (and delete the
-marker). MPC does not crash when pads die -- it stays up, unresponsive -- so
-a dump can be requested well after the failure. Nothing is written unless
-the marker exists. The root cause of the incident is **not** yet found.
+The underlying cause is not yet fully identified — see
+[DESIGN.md's Known limitations](DESIGN.md#known-limitations) for what's
+been ruled out and what's still suspected.
+
+## Building from source
+
+Cross-compiled with `zig cc`, matching the Force's exact glibc — no
+Docker or QEMU needed for this add-on:
+
+```
+ZIG=/path/to/zig ./scripts/build.sh
+```
+
+Writes `addon/forceAudioIn.so` and `addon/injectTone`, ready to deploy
+as-is. See `scripts/build.sh`'s own header comment for the exact `zig
+cc` invocation and target triple.
+
+## Testing
+
+```
+./tests/run.sh
+```
+
+Builds and runs `tests/test_mix.c` natively (host architecture, no
+device or Docker needed). This test `#include`s the real
+`forceAudioIn.c` mixing/attach code directly — it's testing the actual
+shipped logic, not a separate reimplementation of it. It validates the
+ring-attach and mixing logic; it does **not** validate the real ALSA
+interposition itself (which can only be confirmed on-device). See
+`tests/test_mix.c`'s own header comment for the exact scope.
+
+## Diagnostics
+
+Runtime logs are written to **`/tmp/forceAudioIn.log`** on the device.
+
+For deeper investigation, two file-triggered mechanisms exist (no
+device reboot or SSH environment-variable support needed — both are
+plain marker files, checked by a background thread roughly every 200
+ms to 2 seconds):
+
+- **`/tmp/forceAudioIn.diag`** — touch this file to turn on verbose
+  periodic logging (per-voice backlog, gain, routing, underrun counts,
+  etc.) to the log file above.
+- **`/tmp/forceAudioIn.dumpreq`** — touch this file to request a dump
+  of the tap's internal event trace (a rolling record of every attach,
+  read, mix, and trim event) to `/tmp/forceAudioIn.dump.<pid>`. Useful
+  for reconstructing what happened around a specific failure, since
+  MPC itself does not crash when pads go unresponsive — it stays
+  running, so a dump can be requested well after the fact.
+
+## Troubleshooting
+
+**A voice doesn't seem to be making any sound.** Confirm it actually
+attached: check `/tmp/forceAudioIn.log` for a `voice slot N attached`
+line, or touch `/tmp/forceAudioIn.diag` and check the periodic
+per-voice backlog log lines that follow. If nothing shows the voice
+attaching at all, confirm its own process is actually running (via the
+Modules page) and that it's using the same shared-memory ring layout
+this add-on expects (see [DESIGN.md](DESIGN.md) if you're building your
+own voice producer).
+
+**Pads/buttons went unresponsive after restarting `acvs` or
+rebooting.** This is the known issue described in
+[The hard rule](#the-hard-rule) above — it only happens when a voice
+was attached at the moment of the restart. Power-cycle the device to
+recover, then make sure every voice is stopped via the Modules page
+*before* the next `acvs` restart or reboot.
+
+**Audio glitches or small dropouts during long playback.** A confirmed
+(not just suspected) bug in the ring's backlog accounting can alias
+once a voice's true backlog exceeds about 1.5 seconds — most likely if
+a producer keeps rendering across a long gap (e.g. an `acvs` restart)
+with no consumer draining it. See
+[DESIGN.md's Known limitations](DESIGN.md#known-limitations). This is
+a separate issue from the pads/buttons hard rule above and is an audio
+quality issue only.
+
+**Want to check what's going on right now.** Tail the log:
+```
+ssh root@<force-ip> 'tail -f /tmp/forceAudioIn.log'
+```
+
+## Project layout
+
+```
+DESIGN.md            technical design & architecture reference
+src/
+  forceAudioIn.c       the interposer: mixes voice rings into MPC's own capture reads
+  injectTone.c         fixed-tone test producer (smoke-test only)
+  forceAudioInject.h   shared-memory ring layout - the producer/consumer ABI contract
+addon/                the real installable MockbaMod add-on
+                       (manage.sh, run_ForceAudioIn.sh, NSMODULE.json)
+scripts/
+  build.sh             zig cross-build (no Docker needed)
+tests/
+  test_mix.c           native unit test against the real forceAudioIn.c mixing/attach code
+  run.sh               builds and runs test_mix.c natively, no device needed
+```
+
+## Related projects & credits
+
+Built by [sd88me](https://github.com/sd88me).
+
+- **[MockbaMod](https://github.com/MockbaTheBorg/MockbaMod)** by
+  [MockbaTheBorg](https://github.com/MockbaTheBorg) — the custom
+  firmware add-on framework this project is built to run on top of,
+  and a prerequisite for installing it (see
+  [Requirements](#requirements)).
+- **[force-link-audio](https://github.com/macdigi/force-link-audio)**
+  by [macdigi](https://github.com/macdigi) — the mirror-image add-on
+  (output-side tap) this project's own design is the inverse of, and
+  the reference point its interposition approach started from (see
+  [What is the audio-injection tap?](#what-is-the-audio-injection-tap)
+  above).
+- **[force-shadow](https://github.com/sd88me/force-shadow)** — the
+  display/touchscreen equivalent of this project: a shared tap that
+  gives background add-ons a real, native control surface on the
+  Force's own screen, the same way this add-on gives them a real
+  Audio-In signal.
+- **[force-maze](https://github.com/sd88me/force-maze)** — Maze Voice,
+  the first real synth voice to use this add-on's injection tap.
 
 ## License
 
-No upstream license constraints (unlike `force-maze`/`force-acid`, which
-inherit `schwung-*`'s terms for the ported DSP/generator core) - this is
-original interposition/shared-memory code written for this project.
+[MIT](LICENSE) — this is original interposition/shared-memory code
+written for this project, with no upstream license constraints (unlike
+force-maze/force-acid, which inherit the ported Schwung DSP/generator
+core's own terms). See the [LICENSE](LICENSE) file in this repository.
