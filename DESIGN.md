@@ -496,23 +496,54 @@ either, which is the mistake that cost this project several days.
 - **A proper automated regression test for the `acvs`-restart-while-
   attached failure mode does not yet exist**, pending a safe way to
   reproduce it on demand.
-- **The audio paths have not yet been confirmed by ear on real
-  hardware.** As of 2026-09-23 the tap is verified to load and stay
-  loaded across app restarts and cold reboots, with its interposed
-  `snd_pcm_hw_params` hook firing (`44100 Hz`, 4-out/2-in) — but nothing
-  below has been heard yet, because until the symbol-scope bug was fixed
-  the tap could never stay loaded long enough to try:
-  - In-bus (`injectTone --bus in`) still behaving as it did before the
-    rebrand, on an Audio-In track.
-  - Out-bus (`injectTone --bus out`) actually reaching the physical
-    Out 3/4 jacks.
-  - Skipback end-to-end: a WAV landing in
-    `Force Documents/Samples/Skipback/` with the right project/tempo in
-    its name.
-  - Open Question #1 from `docs/PROPOSAL-force-audio-jack.md`: whether
-    restarting `acvs` with an **Out-bus or Skipback** ring attached kills
-    pads/buttons the way it does for In-bus rings. Test deliberately,
-    expecting to have to recover.
+- **`zig cc` 0.13.0 has a real ARM codegen bug**: a variadic `double`
+  argument to `printf`/`fprintf`/`snprintf` is marshaled incorrectly for
+  `arm-linux-gnueabihf`, segfaulting deep inside glibc's `vfprintf` on
+  the device. Bisected down to a bare `printf("%.1f\n", 10.1);` with
+  nothing else in the program — reproducible unconditionally, nothing to
+  do with this project's own code. Hit `skipbackHost`'s startup banner
+  (`"...%.1f MB..."`) and `injectTone`'s own banner identically. Fixed in
+  zig 0.14.1; `scripts/build.sh` now refuses to build with anything
+  older, so this can't silently reappear. If a printf-family call
+  involving a float/double ever segfaults on-device again after a
+  toolchain change, suspect this class of bug first — it costs nothing
+  to check with a bare reproducer on a throwaway binary before assuming
+  the C logic is at fault.
+- **Verified live on real hardware (2026-09-23)**, after the two fixes
+  above: the tap loads and stays loaded across app restarts and cold
+  reboots (`snd_pcm_hw_params` firing, `44100 Hz`, 4-out/2-in); In-bus
+  injection (`injectTone --bus in`) reaches MPC's capture path and gets
+  mixed into whatever the current project has monitoring Audio-In to
+  Main — confirmed numerically (not by ear): a 440 Hz test tone read
+  back out of a Skipback capture measured RMS 6892/peak 9830 (non-silent)
+  and an estimated 435.2 Hz by zero-crossing count, against a totally
+  silent baseline beforehand. Out-bus (`injectTone --bus out`) was
+  confirmed via the diagnostics thread to be actively mixed into
+  channels 2/3 of the real 4-channel hardware handle at the correct
+  real-time rate (`mix_out_one`'s `consumed` counter tracking `produced`
+  at ~44100/s) — reaching the physical jacks themselves still needs ears,
+  since Skipback deliberately only records channels 0/1 (see next point).
+  **Still open**: Open Question #1 from `docs/PROPOSAL-force-audio-jack.md`
+  — whether restarting `acvs` with an Out-bus or Skipback ring attached
+  kills pads/buttons the way it does for In-bus rings. Test deliberately,
+  expecting to have to recover.
+- **Skipback records channels 0/1 (Main mix) only, by design** — it will
+  never see anything injected via `--bus out`, which lives on channels
+  2/3 (physical Out 3/4). This isn't a bug, but it's an easy trap when
+  testing: reaching for `--bus out` to "make sure Skipback has something
+  to record" silently produces a perfectly well-formed, exact-duration,
+  totally silent WAV, because `mix_out_one()` requires `dst_channels >= 4`
+  (a correctness guard, not a defect) while the out-bus signal it mixes
+  never touches the channels Skipback reads. Use `--bus in` (or genuine
+  MPC playback) to put audio where Skipback can actually see it.
+- **Whether an Audio-In injection actually reaches Main is project-state
+  dependent**, not something this tap controls. On the device tested,
+  `injectTone --bus in`'s ring was observed to sit completely undrained
+  (`consumed` stuck at 0 while `produced` climbed) for the first couple
+  of seconds after attaching, then start draining at the correct
+  real-time rate once whatever the current project's Audio-In routing
+  does caught up — worth knowing if a similar test ever appears to
+  "not be working" in its first moment.
 - **The Skipback trigger combo is unsettled.** `SHIFT+RECORD` (the
   original design) is not a valid MidiLoop combo — SHIFT's combo set
   doesn't include RECORD — and was removed; `SELECT+RECORD` was ruled out

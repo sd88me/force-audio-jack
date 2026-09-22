@@ -23,9 +23,32 @@ cd "$(dirname "$0")/.."
 
 ZIG="${ZIG:-zig}"
 TARGET=arm-linux-gnueabihf.2.39   # matches the Force's exact glibc (confirmed live)
+MIN_ZIG_VERSION="0.14.0"          # see the version check below for why
 
 if ! command -v "$ZIG" >/dev/null 2>&1; then
     echo "zig not found (set ZIG=/path/to/zig, or put it on PATH)." >&2
+    exit 1
+fi
+
+# zig 0.13.0 has a real ARM codegen bug: a variadic double argument to
+# printf/fprintf/snprintf gets marshaled incorrectly for arm-linux-gnueabihf,
+# causing a segfault deep inside glibc's vfprintf on the device - confirmed
+# by bisection down to a bare `printf("%.1f\n", 10.1);` with nothing else in
+# the program. This is exactly what skipbackHost's startup banner
+# (`... %.1f MB ...`) and injectTone's own banner hit. Fixed in zig 0.14.1;
+# not otherwise worked around here (no known 0.13.x-safe formatting
+# workaround was found, and there is no reason to keep supporting 0.13.x).
+zig_version=$("$ZIG" version)
+zig_ver_num=${zig_version%%-*}   # strip a "-dev.N+hash" suffix if present
+ver_ge() {   # ver_ge A B -> true if version A >= version B (dotted numeric)
+    [ "$1" = "$2" ] && return 0
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]
+}
+if ! ver_ge "$zig_ver_num" "$MIN_ZIG_VERSION"; then
+    echo "ERROR: zig $zig_version is too old (need >= $MIN_ZIG_VERSION)." >&2
+    echo "zig 0.13.0 miscompiles variadic doubles in printf-family calls on" >&2
+    echo "arm-linux-gnueabihf - a real crash, not a style nit. Get a newer" >&2
+    echo "zig from https://ziglang.org/download/." >&2
     exit 1
 fi
 

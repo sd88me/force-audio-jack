@@ -337,7 +337,15 @@ Proposed split:
    dependency for zero benefit. 57/57 unit tests still pass after the
    rename; both binaries cross-compile clean under the new names.
    Deployed to the device and verified live on 2026-09-23 — the tap loads
-   and stays loaded across app restarts and cold reboots. The audio paths
-   themselves are still unheard; see DESIGN.md's
-   [Known limitations](../DESIGN.md#known-limitations) for what remains
-   to verify by ear.
+   and stays loaded across app restarts and cold reboots, and both
+   In-bus and Out-bus injection were confirmed numerically (a 440 Hz
+   test tone measured non-silent in a Skipback capture; the out-bus
+   ring's consumption rate tracked real time). Two independent real bugs
+   were found and fixed along the way: a zig 0.13.0 ARM codegen bug in
+   variadic-double `printf` calls (crashed `skipbackHost`/`injectTone` on
+   startup, unrelated to this project's own code — see DESIGN.md's
+   [Known limitations](../DESIGN.md#known-limitations)), and the
+   symbol-export-scope bug that caused the original
+   `cereal::RapidJSONException` crash loop. What's left is purely by-ear
+   confirmation (does it sound right, does Out-bus actually reach the
+   physical jacks) and Open Question #1 below.
