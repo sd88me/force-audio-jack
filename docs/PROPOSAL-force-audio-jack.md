@@ -335,6 +335,9 @@ Proposed split:
    deliberately **not** renamed — that's the byte-for-byte contract
    `force-maze` vendors a copy of, and renaming it would break that
    dependency for zero benefit. 57/57 unit tests still pass after the
-   rename; both binaries cross-compile clean under the new names. Not yet
-   deployed to the device (it's currently offline - see
-   `docs/PENDING-DEVICE-FIXES.md`).
+   rename; both binaries cross-compile clean under the new names.
+   Deployed to the device and verified live on 2026-09-23 — the tap loads
+   and stays loaded across app restarts and cold reboots. The audio paths
+   themselves are still unheard; see DESIGN.md's
+   [Known limitations](../DESIGN.md#known-limitations) for what remains
+   to verify by ear.

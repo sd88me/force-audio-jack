@@ -288,7 +288,6 @@ ssh root@<force-ip> 'tail -f /tmp/forceAudioJack.log'
 DESIGN.md                       technical design & architecture reference (the stable In-bus tap)
 docs/
   PROPOSAL-force-audio-jack.md  design + build-order status for Out-bus/Skipback (in progress)
-  PENDING-DEVICE-FIXES.md       fixes staged but not yet applied to the live device
 src/
   forceAudioJack.c              the interposer: readi hook (In-bus) + writei hook (Out-bus, Skipback extraction)
   forceAudioInject.h            In/Out-bus ring layout - the producer/consumer ABI contract

@@ -30,8 +30,27 @@ if ! command -v "$ZIG" >/dev/null 2>&1; then
 fi
 
 echo "== forceAudioJack.so (LD_PRELOAD tap) =="
+# --version-script is load-bearing: it keeps the dynamic symbol table down to
+# just the four interposed snd_pcm_* entry points. Without it zig cc exports
+# its whole statically-linked compiler-rt/libm (memcpy, memset, the math
+# functions, __stack_chk_guard - ~385 symbols), and under LD_PRELOAD those
+# hijack the same calls process-wide in MPC. See scripts/forceAudioJack.map.
 "$ZIG" cc -target "$TARGET" -shared -fPIC -O2 -s \
+    -Wl,--version-script=scripts/forceAudioJack.map \
     -o addon/forceAudioJack.so src/forceAudioJack.c -lpthread -lrt
+
+# Guard against a regression here silently reintroducing the crash: the tap
+# must export exactly the four snd_pcm_* symbols it interposes, nothing else.
+exported=$(readelf --dyn-syms -W addon/forceAudioJack.so \
+    | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK") {print $8}' | sort)
+expected=$(printf '%s\n' snd_pcm_hw_params snd_pcm_readi snd_pcm_readn snd_pcm_writei | sort)
+if [ "$exported" != "$expected" ]; then
+    echo "ERROR: forceAudioJack.so's exported symbols are not the expected four." >&2
+    echo "This will hijack libc/libm calls process-wide inside MPC. Got:" >&2
+    printf '%s\n' "$exported" >&2
+    exit 1
+fi
+echo "   exported symbols OK (exactly the 4 interposed snd_pcm_* entry points)"
 
 echo "== injectTone (test-tone generator, for standalone smoke-testing) =="
 "$ZIG" cc -target "$TARGET" -O2 -s \

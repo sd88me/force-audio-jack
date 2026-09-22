@@ -16,6 +16,7 @@ since they're unit-tested but not yet verified on real hardware.
 
 - [Why this needs LD_PRELOAD at all](#why-this-needs-ld_preload-at-all)
 - [This is LD_PRELOAD, but not the risky kind](#this-is-ld_preload-but-not-the-risky-kind)
+- [Symbol export scope — the sharp edge of interposition](#symbol-export-scope--the-sharp-edge-of-interposition)
 - [Architecture: producer process + shared-memory ring + interposed shim](#architecture-producer-process--shared-memory-ring--interposed-shim)
 - [Multi-voice mixing](#multi-voice-mixing)
 - [Ring re-attach: handling a voice host that restarts](#ring-re-attach-handling-a-voice-host-that-restarts)
@@ -73,9 +74,79 @@ approach was the reference point this add-on's own design started
 from.
 
 Real-time-safe by design: no allocation, syscalls, or logging on the
-hot path (the interposed call itself). All setup happens once in a
-library constructor (`__attribute__((constructor))`), which runs at
-load time, never on the audio thread.
+hot path (the interposed call itself). Setup happens exactly once, in
+`ai_resolve()`, triggered lazily by MPC's own first interposed ALSA call
+— never on the audio thread's steady-state path. It deliberately does
+*not* run from an `__attribute__((constructor))`: a constructor runs at
+library-load time, concurrently with other libraries' constructors and
+JUCE's static initializers, which is a worse neighbourhood to be doing
+setup work in.
+
+## Symbol export scope — the sharp edge of interposition
+
+Symbol interposition is the low-risk technique, but it has one genuinely
+dangerous edge, and this project fell straight off it: **a preloaded
+library must export only the symbols it actually intends to interpose.**
+
+Every exported symbol in an `LD_PRELOAD`'d library is an interposition,
+whether you meant it or not. glibc's dynamic linker resolves to the
+first definition it finds in the global scope, and a preloaded object
+sits at the front of that scope. It does **not** honour the weak/strong
+distinction — that's a static-linker concept. So a stray exported
+`memcpy` is not a harmless duplicate; it silently becomes *the*
+`memcpy` for the entire process.
+
+This bit us hard. `zig cc` statically links its own compiler-rt and libm
+into every `-shared` output, and nothing in the build hid them. The tap
+exported **389** symbols while intending to export 4 — the extras
+included `memcpy`, `memmove`, `memcmp`, `memset`, all of libm, the
+`__aeabi_*` helpers, and `__stack_chk_guard` (the stack canary, as a
+*data* symbol). Result: every `memcpy`/`memcmp`/math call in the whole
+MPC process — MPC itself, libstdc++, RapidJSON, cereal, JUCE,
+libfreetype — was redirected into our library. MPC aborted with
+`cereal::RapidJSONException` on every single boot the tap successfully
+loaded, because RapidJSON is heavily `memcpy`/`memcmp`-driven and was
+being handed subtly different implementations than glibc's tuned ARM
+ones.
+
+**The guard**: `scripts/forceAudioJack.map` is a linker version script
+listing the four `snd_pcm_*` entry points as `global` and everything
+else as `local`, applied via `-Wl,--version-script`. `scripts/build.sh`
+additionally *fails the build* if the exported set is ever anything but
+those four, so this cannot silently regress. Hiding the dead weight also
+took the `.so` from 174KB to 17KB.
+
+**How to verify any interposer, in one command** — preload it onto an
+unrelated binary and watch the linker's own bindings:
+
+```sh
+readelf --dyn-syms -W lib.so | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK")'
+LD_DEBUG=bindings LD_PRELOAD=./lib.so /bin/true 2>&1 | grep 'normal symbol'
+```
+
+If anything you didn't intend shows up bound into your library, that's a
+process-wide hijack waiting to happen. This test needs no device
+restart, no MPC involvement, and no core dumps. For reference, healthy
+interposers on this device export very little: `force_shadow.so` 11
+symbols, `MidiLoop`'s `tkgl_anyctrl_lt.so` 39, and the original
+In-bus-only `forceAudioIn.so` just 3.
+
+**Two debugging lessons worth more than the fix itself:**
+
+- **"Absent from the stack at crash time" does not mean "not causal."** A
+  core dump was read as exonerating this library: all 17 threads' stacks
+  were scanned for addresses inside its mapped range, and none were
+  found. But `memcpy` and friends are *leaf* functions — they corrupt a
+  buffer, return, and are long gone from the stack before the resulting
+  bad JSON is detected and `abort()` fires. The measurement was correct;
+  the conclusion drawn from it was too strong.
+- **When several careful bisections along one axis all come back
+  negative, suspect the axis.** Neutering the `writei` hook to a pure
+  passthrough, moving setup out of the constructor, and shrinking the
+  event-trace ring all failed to help — because all three changed the C
+  logic and left the exported symbol table byte-for-byte identical. The
+  bug was in the link line, which no amount of source bisection could
+  reach.
 
 ## Architecture: producer process + shared-memory ring + interposed shim
 
@@ -244,6 +315,23 @@ lock). This add-on's own locking is defensive regardless of whether
 the same fix has also been applied to other add-ons' own scripts on a
 given device/fork.
 
+**Second, more important mitigation — don't enter the race at all.**
+MockbaMod's boot sequence calls every add-on script with `kill` on every
+`acvs` restart, not just on DISABLE/UNINSTALL. `ForceShadow`'s pattern
+(which this add-on originally copied) strips its own `LD_PRELOAD` entry
+on every such `kill` and unconditionally rewrites it on load — which
+re-enters the boot write race from scratch on every single restart,
+forever. `mockbaMagic` and `MidiLoop` instead never touch the file on
+`kill`, and on load write only if their own entry isn't already present;
+once their entry lands it simply persists. `run_ForceAudioJack.sh` now
+follows that idempotent pattern, so `kill` only stops
+`injectTone`/`skipbackHost` processes and never rewrites the shared file.
+Removal is still handled independently by `manage.sh`'s own `STOP()`, so
+DISABLE/UNINSTALL are unaffected. This is what got the tap loading
+reliably in the first place — which is what finally exposed the real
+crash bug described in
+[Symbol export scope](#symbol-export-scope--the-sharp-edge-of-interposition).
+
 ## Latency management
 
 Bounding backlog needs **hysteresis, not a hard ceiling**. A
@@ -312,6 +400,55 @@ lower-overhead alternative once several tracer-based attempts had
 already ruled themselves out as valid measurement tools for this
 specific issue.
 
+### Core dumps when MPC actually crashes
+
+The Force has a real, undocumented Akai coredump facility at
+`/usr/bin/az01-coredump` (found via `strings`). Create
+`/data/coredumps.enabled` and each crash writes a
+`.core.zst` + `.log.zst` + `.metadata` triple to `/data/coredumps/`. The
+`.metadata` alone is often enough — it names the crashing thread, signal,
+and MPC version. It is left enabled on the device; clean the directory
+out periodically, as each capture is 50-150MB.
+
+Practical notes, learned the hard way:
+
+- Dumps rotate fast during a crash loop (every ~13s), so a `ls` followed
+  by an `scp` can race and fail. Snapshot to a stable directory in one
+  `ssh` command first, then copy from there.
+- `zstd` is not available on the dev machine but *is* on the device —
+  decompress there and copy the plain file back, which works fine even
+  for a 150MB core.
+- No `gdb` or `pyelftools` needed to read one: `readelf -n` gives the
+  `NT_FILE` mapping table, and the ARM `NT_PRSTATUS` notes can be
+  unpacked with plain `struct.unpack` — `pr_reg` is 18 words at byte
+  offset 72, with `sp`/`lr`/`pc` at indices 13/14/15.
+- Read what a dump says narrowly. Mapping a library into the process
+  proves only that it was loaded; finding no trace of it on any stack
+  proves only that it wasn't executing *at abort time*. Neither settles
+  causation for a corrupt-then-crash-later bug. See
+  [Symbol export scope](#symbol-export-scope--the-sharp-edge-of-interposition).
+
+### An `acvs` crash loop is not necessarily this add-on
+
+Two distinct non-force-audio-jack causes have each produced an
+indefinite `acvs` restart loop on this device, both of which survive
+physical power-cycles and look identical from the outside ("the Force
+won't boot"):
+
+- **DrmVncServer winning a race for `/dev/dri/card0`** against MPC's own
+  display init. Tell-tale: `Failed to initialise display (another
+  process running?), aborting!` in `journalctl -u acvs`. Root cause was
+  `MidiLoop`'s `SHIFT+SCENE-8` shortcut calling DrmVncServer's
+  `manage.sh ENABLE`, which sets a *persistent* auto-launch-at-boot flag
+  rather than just toggling the process for that session; that script
+  has been rewritten to start/kill the process directly.
+- **`connmand` abort loops**, which present as Wi-Fi simply never coming
+  up rather than as an MPC problem.
+
+So check `journalctl -u acvs` for the actual signature before assuming
+the audio tap is involved — and equally, don't reflexively exonerate it
+either, which is the mistake that cost this project several days.
+
 ## Known limitations
 
 - **The pads/buttons-dead-on-restart issue is not fully root-caused.**
@@ -319,7 +456,11 @@ specific issue.
   pads/buttons unresponsive (occasionally Wi-Fi); this has never
   happened with zero voices attached. Investigation to date has ruled
   out, via direct evidence: a symbol collision with `MidiLoop`'s own
-  interposer (confirmed disjoint symbol tables); `mockbaMagic`'s
+  interposer (confirmed disjoint symbol tables — though note that check
+  looked at the wrong counterparty, since the collision that did later
+  turn out to matter was with **libc/libm itself**, see
+  [Symbol export scope](#symbol-export-scope--the-sharp-edge-of-interposition));
+  `mockbaMagic`'s
   address-patching mechanism (confirmed dormant/inert on the device
   tested, via disassembly of its actual constructors); the diagnostics
   thread's mere existence; and the per-sample mixing/write loop
@@ -355,6 +496,31 @@ specific issue.
 - **A proper automated regression test for the `acvs`-restart-while-
   attached failure mode does not yet exist**, pending a safe way to
   reproduce it on demand.
+- **The audio paths have not yet been confirmed by ear on real
+  hardware.** As of 2026-09-23 the tap is verified to load and stay
+  loaded across app restarts and cold reboots, with its interposed
+  `snd_pcm_hw_params` hook firing (`44100 Hz`, 4-out/2-in) — but nothing
+  below has been heard yet, because until the symbol-scope bug was fixed
+  the tap could never stay loaded long enough to try:
+  - In-bus (`injectTone --bus in`) still behaving as it did before the
+    rebrand, on an Audio-In track.
+  - Out-bus (`injectTone --bus out`) actually reaching the physical
+    Out 3/4 jacks.
+  - Skipback end-to-end: a WAV landing in
+    `Force Documents/Samples/Skipback/` with the right project/tempo in
+    its name.
+  - Open Question #1 from `docs/PROPOSAL-force-audio-jack.md`: whether
+    restarting `acvs` with an **Out-bus or Skipback** ring attached kills
+    pads/buttons the way it does for In-bus rings. Test deliberately,
+    expecting to have to recover.
+- **The Skipback trigger combo is unsettled.** `SHIFT+RECORD` (the
+  original design) is not a valid MidiLoop combo — SHIFT's combo set
+  doesn't include RECORD — and was removed; `SELECT+RECORD` was ruled out
+  too. It is currently wired to `KNOBS+SCENE-1` as a **temporary test
+  binding**, which overrides ForceShadow's `SCRIPT-19` DX7-page
+  placeholder (a genuine no-op, so low risk, but not free). A permanent
+  combo needs deciding, and ForceShadow's binding restored or
+  deliberately reassigned.
 
 ## Building a new voice producer
 

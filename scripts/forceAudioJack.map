@@ -1,0 +1,24 @@
+/* Linker version script for forceAudioJack.so.
+ *
+ * Restricts the dynamic symbol table to exactly the ALSA entry points this
+ * library interposes. Everything else becomes local.
+ *
+ * This is load-bearing, not hygiene. zig cc statically links its own
+ * compiler-rt and libm into every -shared output, and without this script
+ * all ~385 of those symbols are exported WEAK+DEFAULT - including memcpy,
+ * memmove, memcmp, memset, the whole libm, and the __stack_chk_guard stack
+ * canary. glibc's dynamic linker ignores the weak/strong distinction when
+ * resolving, so under LD_PRELOAD those definitions win process-wide and
+ * every memcpy/memcmp/math call in MPC (and libstdc++, RapidJSON, JUCE...)
+ * gets redirected into this library. That is what caused MPC to abort with
+ * cereal::RapidJSONException on every boot the .so successfully loaded.
+ */
+{
+  global:
+    snd_pcm_hw_params;
+    snd_pcm_readi;
+    snd_pcm_readn;
+    snd_pcm_writei;
+  local:
+    *;
+};
