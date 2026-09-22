@@ -27,62 +27,80 @@ DrmVncServer's auto-launch is currently OFF.
 local repo. `manage.sh ENABLE` run once (arms `forceAudioJack.so`, cleans up
 any stale pre-rename `LD_PRELOAD` entry automatically).
 
-## 3. Still open: the tap has never actually loaded on this device
+## 3. ACTIVE, most important finding: loading forceAudioJack.so crashes MPC
 
-`forceAudioJack.so` has lost the pre-existing `LD_PRELOAD` boot-file race
-on **every** restart attempted across the entire 2026-09-22 session
-(20+ attempts, multiple approaches) — confirmed via `/proc/<MPC-pid>/environ`
-each time, even though `/dev/shm/.LD_PRELOAD` itself always has the correct
-entry. This is the same race that already affected the old
-`forceAudioIn.so`; nothing about the rebrand made it worse, but it's never
-actually won on this device.
+**This supersedes the "boot race" framing below** — kept for the historical
+trail, but the boot-timing angle was a red herring. Here's what's actually
+true, most-confirmed-first:
 
-**A real, separate bug was found and fixed along the way**:
+**`forceAudioJack.so` loading into MPC is what triggers a 100% reproducible
+crash** (`terminate called after throwing an instance of
+'cereal::RapidJSONException'`, deep in MPC's own settings/project JSON
+loading, before MPC's own startup banner even prints). Confirmed via
+`/tmp/forceAudioJack.log`: every one of ~20 consecutive crashing PIDs in
+one run shows `[forceAudioJack] loaded into pid N`. This isn't a rare
+race — once the `.so` is actually loaded, the crash has followed every
+single time observed so far, regardless of *how* it got loaded.
+
+**Ruled out: constructor timing.** The library used to create its
+background thread from `__attribute__((constructor))` (library-load time,
+potentially concurrent with other libraries' own constructors/MPC's static
+initializers). Moved that work into `ai_resolve()`, lazily triggered by
+MPC's own first interposed ALSA call — guaranteed to run only after MPC's
+own startup is complete. The exact same crash still happened. So it's not
+about *when* relative to process startup; something else is wrong.
+
+**Leading hypothesis, not yet tested**: the *original* `forceAudioIn.so`
+(readi-only — no `snd_pcm_writei` interposition, no out-bus injection, no
+skipback extraction) ran in production for weeks with no sign of this.
+Today added the entire `writei` hook as genuinely new code. That's the
+most likely place a real bug lives.
+
+**Next step**: bisect by disabling the `writei` hook (pass straight
+through, no mixing/extraction) and testing whether that loads cleanly. A
+clean load pins the bug to the new out-bus/extraction code; a crash even
+then rules out today's additions and points elsewhere.
+
+**Current device state**: `manage.sh DISABLE`'d — `forceAudioJack.so` is
+NOT in `LD_PRELOAD`. Safe, stable baseline. Don't re-enable without
+checking this section's latest state first.
+
+---
+
+### Historical trail (superseded, kept for context)
+
+A real, separate bug was found and fixed along the way:
 `run_ForceAudioJack.sh`'s own retry loop never terminated (a variable-name
-collision between its own counter and `lock_preload()`'s internal one -
-see the `boot-ld-preload-race-investigation` memory note for the full
-mechanism), leaving a permanently-running zombie process on every boot.
-Fixed by renaming the colliding variable; confirmed via `ps` that no
-zombie remains after a restart. **This did not fix the underlying race**
-— it just stopped an unrelated, self-inflicted resource leak.
+collision between its own counter and `lock_preload()`'s internal one),
+leaving a permanently-running zombie process on every boot. Fixed by
+renaming the colliding variable.
 
-**Root cause of the race itself, investigated in depth**:
-`/media/662522/boot.sh` (the actual live boot sequence — confirmed via
-`az01-launch-MPC`, NOT `boot_old.sh` despite an earlier note in the
-mockbamod-module-creator skill's `gotchas.md` claiming otherwise for this
-fork) backgrounds every `AddOns/*.sh` script with zero synchronization,
-then does a single flat `sleep 1` before reading `LD_PRELOAD` and exec'ing
-MPC. Direct `/proc/uptime` + `/proc/<pid>/stat` timing correlation showed
-MPC's own process appears only ~1s after `run_ForceAudioJack.sh` even
-starts running - meaning this addon's script is often simply late to be
-*scheduled* by the OS in the first place, not slow to write once running.
+Also found and fixed: `run_ForceAudioJack.sh` used to strip its own
+`LD_PRELOAD` entry on every boot-triggered `kill` (not just DISABLE),
+re-entering the write race from scratch every single restart, unlike
+`mockbaMagic`/`MidiLoop`'s own idempotent pattern (write only if not
+already present). Fixed to match their pattern.
 
-**A fix was written for the read side** (poll `$mmLD_PRELOAD_VAR`'s content
-for 4 consecutive unchanged reads, bounded to ~4s, replacing the flat
-`sleep 1`) and tested **four separate times** across the session (including
-once after the zombie bug was fixed and the eMMC was repaired, specifically
-to rule out those as confounds) — **every single attempt reproduced the
-same severe `acvs` crash loop** (`cereal::RapidJSONException`, an
-MPC-internal config-loading crash) within seconds, versus zero crash loops
-across 20+ restarts of the unmodified file. That's strong, now
-confound-controlled evidence that **this specific edit is genuinely,
-reliably causal** — the mechanism is still not understood (the crash
-happens in MPC's own JSON parsing, a code path with no obvious relation to
-shell-script timing), but the correlation is no longer explainable away.
-**Do not re-attempt this fix without a fundamentally different diagnostic
-approach** — e.g. instrumenting MPC's own startup/strace, not just the
-shell-script timing side. The written fix remains preserved on-device as
-`/media/662522/boot.sh.experimental-ldpreload-fix` for whoever picks this
-up next, but treat it as a known-bad starting point, not a promising lead.
+Three separate `boot.sh` read-side timing fixes were tried and reverted
+after each correlated with the same crash loop — but that correlation
+turned out to be because each one *happened to get the `.so` loaded*, not
+because of anything about `boot.sh`'s own timing. Once the
+idempotent-persistence fix above got the `.so` loading reliably *without*
+touching `boot.sh` at all, the same crash still occurred every time,
+which is what revealed the real trigger. **`boot.sh` itself was very
+likely never the problem** — don't avoid editing it based on the earlier
+"4-for-4 correlation" framing without re-reading this section first.
 
 ## Remaining checklist before force-audio-jack is "finished" / releasable
 
 Nothing below has ever actually run on real hardware yet — do this as a
 calm, dedicated session, not appended to other troubleshooting:
 
-- [ ] Get `forceAudioJack.so` actually loaded (win the boot race — retry
-      `manage.sh ENABLE` calmly, or reattempt the `boot.sh` fix above under
-      controlled conditions). Confirm via `/proc/<MPC-pid>/environ`.
+- [ ] **Blocking everything else**: root-cause and fix the
+      `cereal::RapidJSONException` crash from section 3 above. Bisect the
+      `writei` hook first (see "Next step").
+- [ ] Once loading is crash-free: confirm `forceAudioJack.so` stays loaded
+      across a normal restart. Confirm via `/proc/<MPC-pid>/environ`.
 - [ ] Confirm the original In-bus path still works exactly as before the
       rebrand: `injectTone --bus in`, hear/confirm it on an Audio-In track.
 - [ ] Out-bus: `injectTone --bus out`, confirm audio actually reaches the
