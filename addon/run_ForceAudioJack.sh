@@ -38,12 +38,27 @@ LIB="$APPDIR/forceAudioJack.so"
 # it, only make ours safe. mkdir is atomic even on busybox; the retry is
 # bounded and fails OPEN (proceeds unlocked) rather than risk hanging boot
 # forever on a stale lock from a crashed process.
+#
+# BUG FIXED 2026-09-22: this function's own retry counter MUST use a name
+# no caller could plausibly also use for its own loop counter - POSIX sh
+# functions share the caller's variable scope (no `local` in plain sh/ash),
+# so a same-named `i` here silently clobbers a caller's own `i` every time
+# this is called. That's exactly what happened: the "arm the tap" retry
+# loop below used `i` as its own counter, calling this function each
+# iteration - which reset that `i` back to 0 on every call (mkdir succeeds
+# immediately when uncontended, so the while body below never runs and `i`
+# is left at the `i=0` on the very next line), so the outer loop's own
+# `i=$((i+1))` never accumulated past 1 and the outer `while [ $i -lt 5 ]`
+# never terminated. Confirmed live: this left a permanently-running,
+# never-exiting copy of this script on every single boot, hammering this
+# same lock forever - never diagnosed as a hang because it kept re-writing
+# perfectly valid content the whole time, just never actually finishing.
 PRELOAD_LOCK="/dev/shm/.LD_PRELOAD.lock"
 lock_preload() {
-    i=0
+    _lp_tries=0
     while ! mkdir "$PRELOAD_LOCK" 2>/dev/null; do
-        i=$((i + 1))
-        [ $i -ge 50 ] && return 1   # ~5s of retries, then fail open
+        _lp_tries=$((_lp_tries + 1))
+        [ $_lp_tries -ge 50 ] && return 1   # ~5s of retries, then fail open
         sleep 0.1
     done
     return 0
@@ -71,11 +86,24 @@ if [ "$1" = "kill" ]; then
 fi
 
 # ── ARM THE TAP - nothing else ─────────────────────────────
-lock_preload
-if [ -f "$mmLD_PRELOAD_VAR" ]; then
-    FC=$(cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v -E "forceAudioJack|forceAudioIn" | tr "\n" " ")
-    echo "$LIB $FC" > "$mmLD_PRELOAD_VAR"
-else
-    echo "$LIB" > "$mmLD_PRELOAD_VAR"
-fi
-unlock_preload
+# Retry our own write several times over ~1s (matching boot.sh's own flat
+# `sleep 1` before it reads this file into LD_PRELOAD) rather than writing
+# once and hoping - other unlocked addon scripts (mockbaMagic, MidiLoop)
+# can still overwrite the WHOLE file with their own read-modify-write
+# after our single write lands, silently dropping our entry again before
+# boot.sh's read happens. Uses `try` (not `i`) as its own counter - see
+# the 2026-09-22 bug note on lock_preload() above for exactly why that
+# distinction matters.
+try=0
+while [ $try -lt 5 ]; do
+    lock_preload
+    if [ -f "$mmLD_PRELOAD_VAR" ]; then
+        FC=$(cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v -E "forceAudioJack|forceAudioIn" | tr "\n" " ")
+        echo "$LIB $FC" > "$mmLD_PRELOAD_VAR"
+    else
+        echo "$LIB" > "$mmLD_PRELOAD_VAR"
+    fi
+    unlock_preload
+    try=$((try + 1))
+    sleep 0.2
+done
