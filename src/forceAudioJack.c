@@ -111,6 +111,10 @@ typedef long snd_pcm_sframes_t;
 #define AI_DIAG_MARKER "/tmp/forceAudioJack.diag"
 
 static void ai_log(const char *fmt, ...);   /* defined below; forward-declared for ai_dump_events */
+static void *bg_main(void *unused);         /* defined below; forward-declared for ai_resolve() */
+static void ai_try_attach(unsigned slot);          /* defined below; forward-declared for ai_resolve() */
+static void ai_try_attach_out(unsigned slot);      /* defined below; forward-declared for ai_resolve() */
+static void ax_try_attach_skipback(void);          /* defined below; forward-declared for ai_resolve() */
 
 /* ---- lightweight in-process event trace (2026-09-17) --------------------
  * Added after three separate live attempts to observe the open pads-death
@@ -125,8 +129,8 @@ static void ai_log(const char *fmt, ...);   /* defined below; forward-declared f
  * context switch into and out of a separate process.
  *
  * Flushed to a file only on request (AI_DUMP_MARKER - same file-trigger
- * pattern as AI_DIAG_MARKER/AI_CTOR_DELAY_MARKER below, since there's no way
- * to reach an env var in MPC's own exec environment). Confirmed live
+ * pattern as AI_DIAG_MARKER below, since there's no way to reach an env
+ * var in MPC's own exec environment). Confirmed live
  * (2026-09-17): MPC itself does NOT crash when pads go dead, it stays
  * running, just unresponsive - so a dump can be requested well AFTER
  * physically confirming the failure, no need to catch anything in flight. */
@@ -378,6 +382,33 @@ static inline void float_to_sample(unsigned char *buf, size_t off, int fmt, floa
 }
 
 /* ---- init ------------------------------------------------------------- */
+/* ROOT CAUSE FOUND 2026-09-22 (see the long historical comment further down,
+ * near where this used to run from __attribute__((constructor)), for the
+ * full incident this closes): this library's own background thread was
+ * being created from a constructor, which runs at library-LOAD time - i.e.
+ * potentially concurrently with OTHER shared libraries' own constructors
+ * and MPC's/JUCE's own static initializers, all still running on the main
+ * thread, before MPC's main() has even started. Starting a thread that
+ * early is a well-known class of bug: any global/static state that isn't
+ * yet safe for concurrent access (because whoever owns it hasn't finished
+ * single-threaded startup) is now racing against it. Confirmed live: with
+ * this library's constructor doing exactly this, MPC crashed with
+ * 'cereal::RapidJSONException' - an exception thrown deep inside MPC's own
+ * settings/project JSON loading, a code path with no direct relationship
+ * to anything this library does - on 100% of the (rare) boots where this
+ * library actually got loaded, across ~20 consecutive attempts.
+ *
+ * The fix: do ALL of this library's own setup here, in ai_resolve(), which
+ * runs via ensure_init()'s pthread_once - triggered by MPC's own FIRST
+ * call into an interposed ALSA function (snd_pcm_hw_params/readi/writei),
+ * not by library-load time. By the time MPC makes that first call, it has
+ * necessarily finished its own startup (opened its audio codec, which only
+ * happens well into its own main()) - every other library's constructors
+ * and MPC's own static initializers are long done, so spinning up a
+ * background thread here can never race any of that. Same reasoning as
+ * why the dlsym() resolution below was already deferred this way from the
+ * start - this just extends it to the attach-loops and thread creation
+ * that used to run separately, and earlier, in the library constructor. */
 static void ai_resolve(void)
 {
     orig_readi     = dlsym(RTLD_NEXT, "snd_pcm_readi");
@@ -388,6 +419,28 @@ static void ai_resolve(void)
     q_get_channels = dlsym(RTLD_NEXT, "snd_pcm_hw_params_get_channels");
     q_get_rate     = dlsym(RTLD_NEXT, "snd_pcm_hw_params_get_rate");
     q_pcm_name     = dlsym(RTLD_NEXT, "snd_pcm_name");
+
+    ai_evt(AI_EVT_CTOR_START, 0, 0);
+    ai_log("[forceAudioJack] loaded into pid %d", (int)getpid());
+
+    unsigned slot;
+    for (slot = 0; slot < AI_MAX_VOICES; slot++)
+        ai_try_attach(slot);
+    for (slot = 0; slot < AI_MAX_OUT_VOICES; slot++)
+        ai_try_attach_out(slot);
+    ax_try_attach_skipback();
+    ai_log("[forceAudioJack] %u voice(s) attached at load (%u out-bus)", g_n_attached, g_n_attached_out);
+    ai_evt(AI_EVT_CTOR_DONE, 0, g_n_attached);
+
+    /* Safe to create here, unlike from a library constructor - see the
+     * long comment above this function for exactly why. */
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&t, &attr, bg_main, NULL);
+    pthread_attr_destroy(&attr);
+    ai_evt(AI_EVT_THREAD_CREATED, 0, 0);
 }
 
 static inline void ensure_init(void) { pthread_once(&g_once, ai_resolve); }
@@ -537,10 +590,11 @@ static void ax_try_attach_skipback(void)
 }
 
 /* Background thread: three jobs, all off the hot path:
- *   1. Lazy re-attach - retry any slot that was empty at constructor time
- *      (or still is), so a voice host started after MPC comes up gets
- *      picked up without needing another acvs restart. This is now the
- *      reason this thread exists unconditionally (see ai_ctor) - it used
+ *   1. Lazy re-attach - retry any slot that was empty when ai_resolve()
+ *      first ran (or still is), so a voice host started after MPC comes up
+ *      gets picked up without needing another acvs restart. This is now the
+ *      reason this thread exists unconditionally (see ai_resolve() above,
+ *      which is what creates it) - it used
  *      to be diagnostics-only and gated off by default (2026-09-13 open
  *      incident, see DESIGN.md); that gate now only controls job 2 below,
  *      since lazy re-attach needs this thread to always run to do its job.
@@ -646,81 +700,16 @@ static void *bg_main(void *unused)
     return NULL;
 }
 
-/* Controlled experiment, 2026-09-13 (see DESIGN.md open incident): a live
- * test that accidentally ran `systemctl restart acvs` in the background
- * with a concurrent ps-polling loop - extra CPU/scheduling activity during
- * MPC's startup that was absent from every prior test - was the first
- * "voice already attached" restart to NOT kill pads/wifi, after that exact
- * repro shape had failed with zero exceptions across several prior tests.
- * That's a real, if accidental, timing perturbation flipping a previously
- * 100%-reproducible failure - strong evidence this is a race, not a fixed
- * logical bug. Rather than ask for the same accident to be repeated
- * (uncontrolled - we don't know if it was the extra CPU load, the process
- * creation, /proc access from ps, or something else about that shell
- * pipeline), this is a deliberate, controlled version of the same
- * manipulated variable: an opt-in, marker-gated delay at the very start of
- * this constructor, before any attach work happens. If a plain delay alone
- * reproduces the fix across MULTIPLE restarts (not the n=1 the accident
- * gave us), that's clean confirmation of a race resolved by not running
- * this constructor's work "too fast" relative to something else's own
- * startup - and a far better workaround than keeping a polling loop
- * running forever. If it doesn't help, that's equally informative: it
- * rules out simple "we're just too fast" and points back toward something
- * more specific about what ps/scheduling itself perturbed.
- *
- * Marker file content is the delay in milliseconds (e.g. "300"); present
- * but empty or unparseable defaults to 250ms. Absent = no delay (today's
- * default, unchanged behavior). Same file-not-env-var reasoning as
- * AI_DIAG_MARKER - no practical way to set an env var in MPC's own exec
- * environment. */
-#define AI_CTOR_DELAY_MARKER "/tmp/forceAudioJack.delay"
-
-static void ai_maybe_delay(void)
-{
-    FILE *f = fopen(AI_CTOR_DELAY_MARKER, "r");
-    if (!f) return;
-    long ms = 250;
-    char buf[32];
-    if (fgets(buf, sizeof(buf), f)) {
-        long v = strtol(buf, NULL, 10);
-        if (v > 0) ms = v;
-    }
-    fclose(f);
-    ai_log("[forceAudioJack] AI_CTOR_DELAY_MARKER present - delaying constructor %ldms before any attach work", ms);
-    ai_evt(AI_EVT_CTOR_DELAY, 0, (uint32_t)ms);
-    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
-
-__attribute__((constructor))
-static void ai_ctor(void)
-{
-    ai_evt(AI_EVT_CTOR_START, 0, 0);
-    ai_maybe_delay();
-    ai_log("[forceAudioJack] loaded into pid %d", (int)getpid());
-
-    unsigned slot;
-    for (slot = 0; slot < AI_MAX_VOICES; slot++)
-        ai_try_attach(slot);
-    for (slot = 0; slot < AI_MAX_OUT_VOICES; slot++)
-        ai_try_attach_out(slot);
-    ax_try_attach_skipback();
-    ai_log("[forceAudioJack] %u voice(s) attached at load (%u out-bus)", g_n_attached, g_n_attached_out);
-    ai_evt(AI_EVT_CTOR_DONE, 0, g_n_attached);
-
-    /* Unconditional, unlike before: this thread now also does lazy
-     * re-attach (see ai_try_attach/bg_main above), which has to run
-     * regardless of whether any voice happened to exist yet at load time -
-     * that's the whole point. The AI_DIAG_MARKER gate still controls
-     * whether it also logs. */
-    pthread_t t;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&t, &attr, bg_main, NULL);
-    pthread_attr_destroy(&attr);
-    ai_evt(AI_EVT_THREAD_CREATED, 0, 0);
-}
+/* HISTORICAL NOTE: this used to be a `__attribute__((constructor))`
+ * function (`ai_ctor`), gated behind an opt-in delay marker
+ * (`AI_CTOR_DELAY_MARKER`) added 2026-09-13 as a controlled experiment
+ * after a live test accidentally showed that extra timing perturbation
+ * during MPC's own startup (a concurrent ps-polling loop) flipped a
+ * previously 100%-reproducible pads-dead failure. That experiment's own
+ * premise turned out to be right, but the fix wasn't "add a delay" - it
+ * was "don't create a thread from a library constructor at all." See the
+ * long comment on `ai_resolve()` above (where all of this now actually
+ * lives) for the full 2026-09-22 root-cause finding and fix. */
 
 /* Is destination channel `c` (of `dst_channels` total) one this voice should
  * land on, given its `mask` (AI_CHAN_L / AI_CHAN_R / AI_CHAN_LR)? The tapped

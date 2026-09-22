@@ -65,45 +65,58 @@ lock_preload() {
 }
 unlock_preload() { rmdir "$PRELOAD_LOCK" 2>/dev/null; }
 
-# boot.sh calls addon scripts with "kill" on shutdown/restart - full teardown.
-# The grep filter strips BOTH the current (forceAudioJack) and the
-# pre-rename (forceAudioIn) entry - a device upgraded from the old name may
-# still have a stale ".../ForceAudioIn/forceAudioIn.so" path left over in
-# $mmLD_PRELOAD_VAR from before the rename, pointing at a folder that no
-# longer exists; this cleans that up on the very next boot rather than
-# leaving a dangling entry forever.
+# boot.sh calls addon scripts with "kill" on shutdown/restart - full
+# teardown - unconditionally, on EVERY restart, not just DISABLE/UNINSTALL.
+#
+# REDESIGNED 2026-09-22: this used to strip our own LD_PRELOAD entry here,
+# every single restart, then unconditionally re-add it in the "load" path
+# below - meaning this addon re-entered the boot-time write race from
+# scratch on every single restart, forever. Direct comparison against
+# mockbaMagic's and MidiLoop's own run_*.sh (see architecture.md/gotchas.md)
+# found why THEY almost always win it and this addon almost never did:
+# their own "kill" handlers never touch $mmLD_PRELOAD_VAR at all, and their
+# "load" logic only writes if their entry ISN'T already present - so once
+# their entry lands (typically the very first boot after being enabled), it
+# just persists across every future restart untouched, and they're never
+# exposed to the race again. This addon's own strip-then-reader-add pattern
+# (copied from ForceShadow's own run_ForceShadow.sh, which has the SAME
+# flaw - force_shadow.so was also intermittently missing in testing) meant
+# every single restart replayed the race from zero. Confirmed live
+# (2026-09-22): forceAudioJack.so lost this race on every one of 20+
+# restart attempts under the old strip-and-readd design, across every
+# variant tried (single write, 5x retry-write, two different boot.sh
+# read-side fixes - see docs/PENDING-DEVICE-FIXES.md for why those were
+# abandoned). Switching to the same idempotent pattern mockbaMagic/MidiLoop
+# already use, below, needs to win the race at most ONCE (the very first
+# boot after `manage.sh ENABLE`) rather than every single restart forever.
 if [ "$1" = "kill" ]; then
     for p in $(ps 2>/dev/null | grep -E "\[i\]njectTone|\[s\]kipbackHost" | awk '{print $1}'); do
         kill -9 $p 2>/dev/null
     done
-    lock_preload
-    if [ -f "$mmLD_PRELOAD_VAR" ]; then
-        cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v -E "forceAudioJack|forceAudioIn" | tr "\n" " " > /tmp/.p.$$
-        mv /tmp/.p.$$ "$mmLD_PRELOAD_VAR"
-    fi
-    unlock_preload
     exit 0
 fi
 
 # ── ARM THE TAP - nothing else ─────────────────────────────
-# Retry our own write several times over ~1s (matching boot.sh's own flat
-# `sleep 1` before it reads this file into LD_PRELOAD) rather than writing
-# once and hoping - other unlocked addon scripts (mockbaMagic, MidiLoop)
-# can still overwrite the WHOLE file with their own read-modify-write
-# after our single write lands, silently dropping our entry again before
-# boot.sh's read happens. Uses `try` (not `i`) as its own counter - see
-# the 2026-09-22 bug note on lock_preload() above for exactly why that
-# distinction matters.
-try=0
-while [ $try -lt 5 ]; do
-    lock_preload
-    if [ -f "$mmLD_PRELOAD_VAR" ]; then
-        FC=$(cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v -E "forceAudioJack|forceAudioIn" | tr "\n" " ")
-        echo "$LIB $FC" > "$mmLD_PRELOAD_VAR"
-    else
-        echo "$LIB" > "$mmLD_PRELOAD_VAR"
-    fi
-    unlock_preload
-    try=$((try + 1))
-    sleep 0.2
-done
+# Idempotent, matching mockbaMagic's/MidiLoop's own proven pattern: if our
+# entry is already present (the common case, from any previous successful
+# boot), do nothing at all - no lock, no write, no exposure to the race.
+# Only write if genuinely absent (first-ever activation, or DISABLE/
+# UNINSTALL removed it via manage.sh's own STOP() - not this script's
+# "kill" path, which no longer touches this file at all, see above).
+if [ -f "$mmLD_PRELOAD_VAR" ] && grep -qF "$LIB" "$mmLD_PRELOAD_VAR" 2>/dev/null; then
+    exit 0
+fi
+
+lock_preload
+if [ -f "$mmLD_PRELOAD_VAR" ]; then
+    # Still strip a stale pre-rename forceAudioIn entry here too, in case
+    # a device upgraded from the old name has one left over from before
+    # manage.sh ENABLE's own cleanup existed - a dangling path to a folder
+    # that no longer exists, otherwise never removed since this addon's
+    # "kill" no longer touches the file at all.
+    FC=$(cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v -E "forceAudioJack|forceAudioIn" | tr "\n" " ")
+    echo "$LIB $FC" > "$mmLD_PRELOAD_VAR"
+else
+    echo "$LIB" > "$mmLD_PRELOAD_VAR"
+fi
+unlock_preload
