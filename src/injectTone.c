@@ -107,6 +107,30 @@ int main(int argc, char **argv)
         uint32_t tail = __atomic_load_n(&shm->tail, __ATOMIC_ACQUIRE);
         uint32_t space = (AI_RING_FRAMES - 1) - ((head - tail) & (AI_RING_FRAMES - 1));
 
+        /* Pace slightly FASTER than real-time, not exactly at it: sleeping
+         * the full block-equivalent duration after every write (the
+         * original code) has zero margin, and an ordinary nanosleep
+         * overshoot - the norm, not the exception, on a non-realtime-
+         * scheduled thread - then makes the producer fall a little behind
+         * on every single iteration, with nothing to ever catch it back up.
+         * That produced a steady ~5-6 underruns/sec on real hardware
+         * regardless of system load (confirmed 2026-09-23: nearly identical
+         * underrun rate whether or not anything else was running), each one
+         * a real, audible 128-sample gap of silence in whatever this tone
+         * was mixed into - this is what "glitchy skipback playback" traced
+         * back to. Sleeping for a fraction of the block's real-time
+         * duration instead (still throttled, so this never busy-loops or
+         * floods the ring - just biased to arrive a bit early) lets a
+         * small, bounded cushion build up for the consumer's own trim logic
+         * (AI_LATENCY_TARGET_FRAMES) to draw down against, self-correcting
+         * the drift instead of racing it every block. An earlier version of
+         * this fix removed the sleep after a successful write entirely,
+         * which is wrong: with nothing bounding the producer's rate at all,
+         * it ran far faster than real-time between backpressure checks,
+         * and the consumer's own trim logic ended up discarding nearly
+         * everything produced (confirmed: 82M+ frames produced in
+         * ~1s, 1380 trim events discarding almost all of it) while burning
+         * CPU the whole system needed. Bounded pacing avoids both extremes. */
         if (space < BLOCK_FRAMES) {
             nanosleep(&block_time, NULL);
             continue;
@@ -137,7 +161,14 @@ int main(int argc, char **argv)
             (void)reported;
         }
 
-        nanosleep(&block_time, NULL);
+        /* Sleep for 80% of the block's real-time duration, not 100% - see
+         * the comment above the space check for why full-duration pacing
+         * (the original bug) and no pacing at all (an intermediate, wrong
+         * fix) both fail. This margin is deliberately generous: even a few
+         * ms of scheduling jitter per block is smaller than the 20% margin
+         * at BLOCK_FRAMES=256 (5.8ms/block, so ~1.2ms of slack per block). */
+        struct timespec margin_sleep = { 0, block_time.tv_nsec * 4 / 5 };
+        nanosleep(&margin_sleep, NULL);
     }
 
     munmap(shm, AI_SHM_BYTES);
