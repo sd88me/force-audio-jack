@@ -1,17 +1,17 @@
 /*
  * Shared memory layout between the injector process(es) (e.g. injectTone,
  * maze_host, or any future audio-rendering voice host built the same way)
- * and forceAudioIn.so, the LD_PRELOAD shim that mixes injected audio into
+ * and forceAudioJack.so, the LD_PRELOAD shim that mixes injected audio into
  * what /usr/bin/MPC reads from its capture device.
  *
  * The producer (injector) always writes 32-bit float, mono or stereo, at a
- * fixed rate it declares in the header. forceAudioIn.so does the conversion
+ * fixed rate it declares in the header. forceAudioJack.so does the conversion
  * to whatever format/channel count MPC actually configured on the capture
  * handle - the producer never needs to know or care what MPC is doing.
  *
  * MULTIPLE SIMULTANEOUS VOICES: each voice host is the sole producer of its
  * OWN ring, in its own shared-memory segment, named by a small integer slot
- * (AI_SHM_NAME_FMT). forceAudioIn.so attaches to every slot that exists
+ * (AI_SHM_NAME_FMT). forceAudioJack.so attaches to every slot that exists
  * (0..AI_MAX_VOICES-1) and sums them all into the one real capture buffer -
  * this keeps every ring genuinely single-producer/single-consumer (no
  * cross-process synchronization needed beyond what already exists per ring)
@@ -22,8 +22,8 @@
  * PER-VOICE MIX CONTROL: `enabled`/`gain`/`channel_mask` are the host-level
  * "voice out" controls (on/off, volume, L/R/L+R routing) a voice's own
  * control socket writes directly - there is no separate central mixer
- * process. `enabled` mutes the *mix*, not the render: forceAudioIn.so still
- * drains the ring at the normal rate while muted (see forceAudioIn.c's
+ * process. `enabled` mutes the *mix*, not the render: forceAudioJack.so still
+ * drains the ring at the normal rate while muted (see forceAudioJack.c's
  * mix_in) so a re-enabled voice doesn't resume from a stale backlog, and the
  * producer's render cadence - which is the synth's actual clock for envelopes
  * and filters - is never told to skip a tick.
@@ -35,7 +35,23 @@
 #include <stdio.h>
 
 #define AI_SHM_NAME_FMT "/forceAudioInject%u"  /* %u = voice slot, 0..AI_MAX_VOICES-1 */
-#define AI_MAX_VOICES  4              /* how many simultaneous voice hosts forceAudioIn.so will attach to */
+#define AI_MAX_VOICES  4              /* how many simultaneous voice hosts forceAudioJack.so will attach to */
+
+/* Out-bus (physical Out 3/4) injection - same ai_shm_t shape, a distinct
+ * shm namespace so it never collides with (or is mistaken for) an In-bus
+ * ring. Confirmed live (192.168.1.187): the Force's ADA2 playback PCM is a
+ * single exclusively-held 4-channel handle - channels 0/1 are MPC's own
+ * main mix, channels 2/3 are the physical Out 3/4 jacks. There is no
+ * separate ALSA device for Out 3/4 to open directly, so a producer that
+ * wants its audio on Out 3/4 instead of (or as well as) Audio-In 1/2 uses
+ * this ring name instead of AI_SHM_NAME_FMT - same struct, same producer
+ * code, just a different destination for forceAudioJack.so to attach it to.
+ * `channel_mask`'s AI_CHAN_L/AI_CHAN_R bits mean "Out 3"/"Out 4" here, not
+ * "L/R" - same bits, direction-dependent meaning, same as how they mean
+ * "capture channel 0/1" on an In-bus ring. */
+#define AI_SHM_NAME_FMT_OUT "/forceAudioJackOut%u"  /* %u = voice slot, 0..AI_MAX_OUT_VOICES-1 */
+#define AI_MAX_OUT_VOICES 2
+
 #define AI_MAGIC       0x414e4a49u   /* 'AINJ' */
 #define AI_RING_FRAMES (1u << 16)    /* 65536 frames of ring, per channel slot */
 #define AI_MAX_CH      2
@@ -55,7 +71,7 @@ typedef struct {
     uint32_t channels;             /* producer's channel count: 1 or 2        */
 
     /* Host-level mix controls - written by the voice's own control socket
-     * (e.g. maze_host's "SET mix.gain"), read by forceAudioIn.so's mix_in()
+     * (e.g. maze_host's "SET mix.gain"), read by forceAudioJack.so's mix_in()
      * on the audio thread. Plain volatile reads/writes, not the acquire/
      * release pattern used for head/tail below: these are independent
      * scalars (not part of the ring's producer/consumer handshake), each a
@@ -87,6 +103,12 @@ typedef struct {
  * so there's nothing to race here. */
 static inline void ai_shm_name(unsigned slot, char *buf, size_t buflen) {
     snprintf(buf, buflen, AI_SHM_NAME_FMT, slot);
+}
+
+/* Same, for an Out-bus (physical Out 3/4) ring - see AI_SHM_NAME_FMT_OUT
+ * above for why this is a separate namespace from ai_shm_name(). */
+static inline void ai_shm_name_out(unsigned slot, char *buf, size_t buflen) {
+    snprintf(buf, buflen, AI_SHM_NAME_FMT_OUT, slot);
 }
 
 #endif

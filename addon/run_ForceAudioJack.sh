@@ -1,30 +1,32 @@
 #!/bin/sh
 ############################################################
-# ForceAudioIn — autostart hook.
+# ForceAudioJack — autostart hook (formerly ForceAudioIn - renamed when
+# out-bus/skipback features were merged in; see docs/PROPOSAL-force-audio-jack.md).
 # Copy this file into the AddOns FOLDER ROOT to enable.
 # MockbaMod's boot.sh runs every *.sh in AddOns/ at startup.
 #
 # ARMS THE TAP ONLY. Does not start any producer (not injectTone, not any
-# voice-host addon's binary) - see manage.sh's header comment for why:
-# every live test of "acvs restart while a voice is attached" has failed,
-# while "forceAudioIn.so armed with zero voices" has survived every
-# repeated-restart test run against it, including a real physical reboot.
-# So this script's whole job at boot is: arm the tap, attach nothing.
+# voice-host addon's binary, not skipbackHost) - see manage.sh's header
+# comment for why: every live test of "acvs restart while a voice is
+# attached" has failed, while "forceAudioJack.so armed with zero voices"
+# has survived every repeated-restart test run against it, including a
+# real physical reboot. So this script's whole job at boot is: arm the
+# tap, attach nothing.
 #
 # Voices attach later, entirely through their own nodeServer Modules-page
 # toggle (which spawns a process directly - no LD_PRELOAD, no acvs
-# restart). forceAudioIn.so's own background thread lazily re-attaches
-# any voice ring that appears (or reappears, e.g. after a stop/restart)
-# within ~2s, with no restart needed. This addon being the ONLY one that
-# ever touches $mmLD_PRELOAD_VAR's forceAudioIn entry is what makes that
-# safe - if two addons both armed the tap, they'd race on this same file
-# exactly like mockbaMagic/MidiLoop once did (see README.md).
+# restart). forceAudioJack.so's own background thread lazily re-attaches
+# any voice/skipback ring that appears (or reappears, e.g. after a
+# stop/restart) within ~2s, with no restart needed. This addon being the
+# ONLY one that ever touches $mmLD_PRELOAD_VAR's forceAudioJack entry is
+# what makes that safe - if two addons both armed the tap, they'd race on
+# this same file exactly like mockbaMagic/MidiLoop once did (see README.md).
 ############################################################
 
 mmPath=$(cat /dev/shm/.mmPath)
 . $mmPath/MockbaMod/env.sh
-APPDIR="$mmPath/AddOns/ForceAudioIn"
-LIB="$APPDIR/forceAudioIn.so"
+APPDIR="$mmPath/AddOns/ForceAudioJack"
+LIB="$APPDIR/forceAudioJack.so"
 
 # ── Locking around $mmLD_PRELOAD_VAR ────────────────────────
 # CONFIRMED live (2026-09-13): mockbaMagic's and MidiLoop's own run_*.sh
@@ -49,13 +51,19 @@ lock_preload() {
 unlock_preload() { rmdir "$PRELOAD_LOCK" 2>/dev/null; }
 
 # boot.sh calls addon scripts with "kill" on shutdown/restart - full teardown.
+# The grep filter strips BOTH the current (forceAudioJack) and the
+# pre-rename (forceAudioIn) entry - a device upgraded from the old name may
+# still have a stale ".../ForceAudioIn/forceAudioIn.so" path left over in
+# $mmLD_PRELOAD_VAR from before the rename, pointing at a folder that no
+# longer exists; this cleans that up on the very next boot rather than
+# leaving a dangling entry forever.
 if [ "$1" = "kill" ]; then
-    for p in $(ps 2>/dev/null | grep "[i]njectTone" | awk '{print $1}'); do
+    for p in $(ps 2>/dev/null | grep -E "\[i\]njectTone|\[s\]kipbackHost" | awk '{print $1}'); do
         kill -9 $p 2>/dev/null
     done
     lock_preload
     if [ -f "$mmLD_PRELOAD_VAR" ]; then
-        cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v forceAudioIn | tr "\n" " " > /tmp/.p.$$
+        cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v -E "forceAudioJack|forceAudioIn" | tr "\n" " " > /tmp/.p.$$
         mv /tmp/.p.$$ "$mmLD_PRELOAD_VAR"
     fi
     unlock_preload
@@ -65,7 +73,7 @@ fi
 # ── ARM THE TAP - nothing else ─────────────────────────────
 lock_preload
 if [ -f "$mmLD_PRELOAD_VAR" ]; then
-    FC=$(cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v forceAudioIn | tr "\n" " ")
+    FC=$(cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v -E "forceAudioJack|forceAudioIn" | tr "\n" " ")
     echo "$LIB $FC" > "$mmLD_PRELOAD_VAR"
 else
     echo "$LIB" > "$mmLD_PRELOAD_VAR"

@@ -1,0 +1,15 @@
+{
+  "NAME": "Force Audio Jack - Skipback",
+  "DESCRIPTION": "Continuously records the Force's real main-mix output into a rolling buffer, so a SHIFT+RECORD shortcut can save the last N seconds retroactively (Schwung's Skipback feature). Toggling RUNNING here only starts/stops skipbackHost itself - it does not arm forceAudioJack.so or restart acvs, so it only actually captures anything if ForceAudioJack's own manage.sh ENABLE has already been run. See docs/PROPOSAL-force-audio-jack.md.",
+  "PROCESSNAME": "skipbackHost",
+  "DIRNAME": "ForceAudioJackSkipback",
+  "FILENAME": "skipbackHost",
+  "BACKGROUND": true,
+  "AUTOLAUNCHABLE": false,
+  "ARGUMENTS": [
+    { "NAME": "window flag", "VALUE": "--window-sec" },
+    { "NAME": "rolling window seconds (max 60)", "VALUE": "30" },
+    { "NAME": "output-dir flag", "VALUE": "--output-dir" },
+    { "NAME": "output folder", "VALUE": "/sdcard/Force Documents/Samples/Skipback" }
+  ]
+}

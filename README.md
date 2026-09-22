@@ -1,18 +1,24 @@
-# force-audioin
+# force-audio-jack
 
-**A shared audio-injection tap for the Akai Force — the prerequisite
-add-on that lets a background synth or generator process appear as
-live signal on a real Audio-In track, with no hardware loopback
-cable.**
+**A shared audio tap for the Akai Force — the prerequisite add-on that
+lets a background synth or generator process appear as live signal on
+a real Audio-In track (or the physical Out 3/4 jacks), with no
+hardware loopback cable, plus Skipback (continuous background
+recording so a shortcut can save the last N seconds retroactively).**
 
-force-audioin is not a synth or sequencer in its own right — it makes
+force-audio-jack is not a synth or sequencer in its own right — it makes
 no sound by itself. It's the shared, always-on tap that other
 add-ons (Maze Voice, and any future voice-producing add-on) inject
-their own rendered audio through.
+their own rendered audio through. Formerly named force-audioin;
+renamed when Out 3/4 injection and Skipback were merged in.
 
-**Status: v1.0 — stable release**, running on real Force hardware.
-This document is the install/usage manual. For internals and the full
-technical design, see [DESIGN.md](DESIGN.md).
+**Status: the original In-bus (Audio-In 1/2) injection tap is v1.0,
+stable on real Force hardware.** Out-bus (physical Out 3/4) injection
+and Skipback are newly built and unit-tested but **not yet verified on
+real hardware** — see [docs/PROPOSAL-force-audio-jack.md](docs/PROPOSAL-force-audio-jack.md)
+for exactly what's implemented vs. still pending. This document is the
+install/usage manual for the stable In-bus tap. For internals and the
+full technical design, see [DESIGN.md](DESIGN.md).
 
 ---
 
@@ -22,7 +28,7 @@ technical design, see [DESIGN.md](DESIGN.md).
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
-- [Using force-audioin](#using-force-audioin)
+- [Using force-audio-jack](#using-force-audio-jack)
 - [The hard rule](#the-hard-rule)
 - [Building from source](#building-from-source)
 - [Testing](#testing)
@@ -44,12 +50,12 @@ audio in a separate background process (rather than as a plugin
 inside MPC itself): there's no supported way for that audio to reach
 a real Audio-In track.
 
-**force-audioin solves this by mixing injected audio directly into
+**force-audio-jack solves this by mixing injected audio directly into
 what MPC itself reads from its own capture device**, live, in real
 time — no cable, no hardware loopback, no change to how MPC's Audio-In
 track behaves. A separate process (Maze Voice's `maze_host`, or this
 add-on's own test tone generator, `injectTone`) renders audio into a
-small shared-memory ring buffer; force-audioin's tap reads from that
+small shared-memory ring buffer; force-audio-jack's tap reads from that
 ring and adds it directly into MPC's own captured audio, sample by
 sample, on the real audio thread. A real instrument plugged into the
 physical input keeps working completely unmodified alongside whatever
@@ -62,7 +68,7 @@ both exist to give a background process a real, native-feeling
 integration point with the Force's own hardware, without changing
 anything about how MPC itself works.
 
-force-audioin is the mirror image of
+force-audio-jack is the mirror image of
 **[force-link-audio](https://github.com/macdigi/force-link-audio)**, an
 add-on by [macdigi](https://github.com/macdigi) that taps the *output*
 side (`snd_pcm_writei`) to extract what the Force is playing; this
@@ -84,7 +90,7 @@ the reference point this add-on's design started from.
 - **Real instruments keep working.** Injection is purely additive: a
   real instrument on the physical audio input is never touched or
   replaced.
-- **Starts on demand, not at boot.** force-audioin itself arms at boot
+- **Starts on demand, not at boot.** force-audio-jack itself arms at boot
   with **zero voices ever attached** — a voice-producing process is
   only ever started later, on demand, from the Force's own nodeServer
   Modules page.
@@ -102,11 +108,20 @@ the reference point this add-on's design started from.
 - **Includes a built-in test signal.** `injectTone`, a minimal sine
   wave generator, proves the whole injection path works before ever
   wiring up a real synth.
+- **Out-bus injection (new, not yet hardware-verified).** The same
+  additive mixing, symmetrically, into the physical Out 3/4 jacks
+  instead of Audio-In 1/2 — lets a synth module choose whether its
+  audio stays inside Force OS or goes out to an external
+  device/mixer. See [docs/PROPOSAL-force-audio-jack.md](docs/PROPOSAL-force-audio-jack.md).
+- **Skipback (new, not yet hardware-verified).** Continuously records
+  the real main-mix output into a rolling buffer, so a `SHIFT+RECORD`
+  shortcut saves the last N seconds retroactively as a WAV, named with
+  the current project and tempo when available.
 
 ## Requirements
 
 - An Akai Force running
-  [MockbaMod](https://github.com/MockbaTheBorg/MockbaMod) — force-audioin
+  [MockbaMod](https://github.com/MockbaTheBorg/MockbaMod) — force-audio-jack
   is installed as a MockbaMod add-on.
 - SSH access to the device for installation.
 - No other software to install on the Force itself.
@@ -121,12 +136,12 @@ the reference point this add-on's design started from.
    (`scp -r` copies `addon` *into* an existing destination rather than
    replacing it, so remove any old copy first):
    ```
-   ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceAudioIn'
-   scp -r addon root@<force-ip>:/media/<serial>/AddOns/ForceAudioIn
+   ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceAudioJack'
+   scp -r addon root@<force-ip>:/media/<serial>/AddOns/ForceAudioJack
    ```
 2. **Enable it:**
    ```
-   ssh root@<force-ip> '/media/<serial>/AddOns/ForceAudioIn/manage.sh ENABLE'
+   ssh root@<force-ip> '/media/<serial>/AddOns/ForceAudioJack/manage.sh ENABLE'
    ```
    This arms the tap at boot with **zero voices ever attached** — it
    does not start `injectTone` or any other producer by itself. This
@@ -144,7 +159,7 @@ To remove or disable the add-on later, use `manage.sh`'s own commands
 family (see `manage.sh`'s own usage output on the device for the exact
 options available).
 
-## Using force-audioin
+## Using force-audio-jack
 
 **Starting a voice:** open the Force's own nodeServer Modules page
 (`/moduler`) and start the voice-producing process you want — this
@@ -160,7 +175,7 @@ does a clean process kill with no `acvs` restart involved.
 
 **Adjusting a voice's volume, mute, or L/R routing:** these are
 controlled directly by that voice's own control socket (e.g. Maze
-Voice's own on-screen or web controls) — force-audioin itself has no
+Voice's own on-screen or web controls) — force-audio-jack itself has no
 separate mixer page of its own.
 
 ## The hard rule
@@ -169,7 +184,7 @@ separate mixer page of its own.
 
 Extensive live testing found that doing so can reliably kill
 pads/buttons (occasionally Wi-Fi) — on the very first restart, not
-gradually — while force-audioin is armed with a voice actually
+gradually — while force-audio-jack is armed with a voice actually
 attached. With **zero** voices attached, by contrast, `acvs` restarts
 (and full physical reboots) have never failed a single test.
 
@@ -198,7 +213,7 @@ Docker or QEMU needed for this add-on:
 ZIG=/path/to/zig ./scripts/build.sh
 ```
 
-Writes `addon/forceAudioIn.so` and `addon/injectTone`, ready to deploy
+Writes `addon/forceAudioJack.so` and `addon/injectTone`, ready to deploy
 as-is. See `scripts/build.sh`'s own header comment for the exact `zig
 cc` invocation and target triple.
 
@@ -210,7 +225,7 @@ cc` invocation and target triple.
 
 Builds and runs `tests/test_mix.c` natively (host architecture, no
 device or Docker needed). This test `#include`s the real
-`forceAudioIn.c` mixing/attach code directly — it's testing the actual
+`forceAudioJack.c` mixing/attach code directly — it's testing the actual
 shipped logic, not a separate reimplementation of it. It validates the
 ring-attach and mixing logic; it does **not** validate the real ALSA
 interposition itself (which can only be confirmed on-device). See
@@ -218,19 +233,19 @@ interposition itself (which can only be confirmed on-device). See
 
 ## Diagnostics
 
-Runtime logs are written to **`/tmp/forceAudioIn.log`** on the device.
+Runtime logs are written to **`/tmp/forceAudioJack.log`** on the device.
 
 For deeper investigation, two file-triggered mechanisms exist (no
 device reboot or SSH environment-variable support needed — both are
 plain marker files, checked by a background thread roughly every 200
 ms to 2 seconds):
 
-- **`/tmp/forceAudioIn.diag`** — touch this file to turn on verbose
+- **`/tmp/forceAudioJack.diag`** — touch this file to turn on verbose
   periodic logging (per-voice backlog, gain, routing, underrun counts,
   etc.) to the log file above.
-- **`/tmp/forceAudioIn.dumpreq`** — touch this file to request a dump
+- **`/tmp/forceAudioJack.dumpreq`** — touch this file to request a dump
   of the tap's internal event trace (a rolling record of every attach,
-  read, mix, and trim event) to `/tmp/forceAudioIn.dump.<pid>`. Useful
+  read, mix, and trim event) to `/tmp/forceAudioJack.dump.<pid>`. Useful
   for reconstructing what happened around a specific failure, since
   MPC itself does not crash when pads go unresponsive — it stays
   running, so a dump can be requested well after the fact.
@@ -238,8 +253,8 @@ ms to 2 seconds):
 ## Troubleshooting
 
 **A voice doesn't seem to be making any sound.** Confirm it actually
-attached: check `/tmp/forceAudioIn.log` for a `voice slot N attached`
-line, or touch `/tmp/forceAudioIn.diag` and check the periodic
+attached: check `/tmp/forceAudioJack.log` for a `voice slot N attached`
+line, or touch `/tmp/forceAudioJack.diag` and check the periodic
 per-voice backlog log lines that follow. If nothing shows the voice
 attaching at all, confirm its own process is actually running (via the
 Modules page) and that it's using the same shared-memory ring layout
@@ -264,24 +279,31 @@ quality issue only.
 
 **Want to check what's going on right now.** Tail the log:
 ```
-ssh root@<force-ip> 'tail -f /tmp/forceAudioIn.log'
+ssh root@<force-ip> 'tail -f /tmp/forceAudioJack.log'
 ```
 
 ## Project layout
 
 ```
-DESIGN.md            technical design & architecture reference
+DESIGN.md                       technical design & architecture reference (the stable In-bus tap)
+docs/
+  PROPOSAL-force-audio-jack.md  design + build-order status for Out-bus/Skipback (in progress)
+  PENDING-DEVICE-FIXES.md       fixes staged but not yet applied to the live device
 src/
-  forceAudioIn.c       the interposer: mixes voice rings into MPC's own capture reads
-  injectTone.c         fixed-tone test producer (smoke-test only)
-  forceAudioInject.h   shared-memory ring layout - the producer/consumer ABI contract
-addon/                the real installable MockbaMod add-on
-                       (manage.sh, run_ForceAudioIn.sh, NSMODULE.json)
+  forceAudioJack.c              the interposer: readi hook (In-bus) + writei hook (Out-bus, Skipback extraction)
+  forceAudioInject.h            In/Out-bus ring layout - the producer/consumer ABI contract
+  forceAudioJackExtract.h       Skipback extraction-ring layout (reversed producer/consumer roles)
+  injectTone.c                  fixed-tone test producer (smoke-test only; --bus in|out)
+  skipbackHost.c                Skipback consumer: rolling buffer, WAV-on-trigger
+addon/                          installable MockbaMod add-on (AddOns/ForceAudioJack)
+                                 (manage.sh, run_ForceAudioJack.sh, NSMODULE.json, forceAudioJack.so, injectTone)
+addon-skipback/                 skipbackHost's own AddOns folder (AddOns/ForceAudioJackSkipback) -
+                                 needs a separate folder for its own Modules-page toggle
 scripts/
-  build.sh             zig cross-build (no Docker needed)
+  build.sh                      zig cross-build (no Docker needed)
 tests/
-  test_mix.c           native unit test against the real forceAudioIn.c mixing/attach code
-  run.sh               builds and runs test_mix.c natively, no device needed
+  test_mix.c                    native unit test against the real forceAudioJack.c mixing/attach code
+  run.sh                        builds and runs test_mix.c natively, no device needed
 ```
 
 ## Related projects & credits

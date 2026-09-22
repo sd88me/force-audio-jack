@@ -1,5 +1,5 @@
 /*
- * forceAudioIn.so — LD_PRELOAD audio injector for the Akai Force's MPC
+ * forceAudioJack.so — LD_PRELOAD audio injector for the Akai Force's MPC
  * application. The inverse of MockbaMod's forceStream.so (which taps
  * snd_pcm_writei to EXTRACT what MPC plays): this hooks snd_pcm_readi to
  * MIX synthesized audio INTO what MPC reads from its capture device, so a
@@ -55,7 +55,7 @@
  *
  * BUILD (cross-compiled with zig, matching the Force's exact glibc):
  *   zig cc -target arm-linux-gnueabihf.2.39 -shared -fPIC -O2 \
- *       -o forceAudioIn.so forceAudioIn.c -lpthread -lrt
+ *       -o forceAudioJack.so forceAudioJack.c -lpthread -lrt
  */
 
 #define _GNU_SOURCE
@@ -73,6 +73,7 @@
 #include <sys/stat.h>
 
 #include "forceAudioInject.h"
+#include "forceAudioJackExtract.h"
 
 /* Opaque ALSA types - we never dereference these, so no ALSA headers needed. */
 typedef struct _snd_pcm snd_pcm_t;
@@ -80,7 +81,7 @@ typedef struct _snd_pcm_hw_params snd_pcm_hw_params_t;
 typedef unsigned long snd_pcm_uframes_t;
 typedef long snd_pcm_sframes_t;
 
-#define LOG_PATH "/tmp/forceAudioIn.log"
+#define LOG_PATH "/tmp/forceAudioJack.log"
 
 /* Open incident 2026-09-13 (see DESIGN.md for the full live-tested
  * elimination sequence): pads/buttons go dead partway through repeated
@@ -89,7 +90,7 @@ typedef long snd_pcm_sframes_t;
  * so NOT the known file-race. Ruled out so far, each with a live test:
  * an ALSA symbol collision with MidiLoop's tkgl_anyctrl_lt.so (disjoint
  * symbol sets); the diagnostics thread's mere existence (still failed with
- * it confirmed not spawning); forceAudioIn.so merely being loaded with zero
+ * it confirmed not spawning); forceAudioJack.so merely being loaded with zero
  * voices attached (survived repeated restarts cleanly); the per-sample
  * write loop in mix_in_one specifically (still failed with a voice attached
  * but muted, i.e. that inner loop skipped every call). Current standing:
@@ -103,11 +104,11 @@ typedef long snd_pcm_sframes_t;
  * anyone wants it logged.
  *
  * Gated off by default behind a marker FILE rather than an env var:
- * forceAudioIn.so is LD_PRELOAD'd into MPC by a boot script, not launched
+ * forceAudioJack.so is LD_PRELOAD'd into MPC by a boot script, not launched
  * directly, so there's no practical way to set an environment variable in
  * MPC's own exec environment - a file checked once at library-load time is
  * trivially toggleable over SSH with no rebuild and no boot-script change. */
-#define AI_DIAG_MARKER "/tmp/forceAudioIn.diag"
+#define AI_DIAG_MARKER "/tmp/forceAudioJack.diag"
 
 static void ai_log(const char *fmt, ...);   /* defined below; forward-declared for ai_dump_events */
 
@@ -129,7 +130,7 @@ static void ai_log(const char *fmt, ...);   /* defined below; forward-declared f
  * (2026-09-17): MPC itself does NOT crash when pads go dead, it stays
  * running, just unresponsive - so a dump can be requested well AFTER
  * physically confirming the failure, no need to catch anything in flight. */
-#define AI_DUMP_MARKER "/tmp/forceAudioIn.dumpreq"
+#define AI_DUMP_MARKER "/tmp/forceAudioJack.dumpreq"
 #define AI_EVT_CAP     65536u   /* ring capacity, indexed mod this (power of 2) */
 
 enum {
@@ -147,6 +148,16 @@ enum {
     AI_EVT_TRIM,
     AI_EVT_UNDERRUN,
     AI_EVT_BG_WAKE,
+    /* Out-bus (physical Out 3/4 injection) events, added alongside the
+     * snd_pcm_writei hook. ATTACH_TRY/ATTACHED/REATTACHED/MIX_ONE/TRIM/
+     * UNDERRUN above are reused for out-bus slots too (d16 carries the slot
+     * number offset by AI_MAX_VOICES, so a dump reader can tell which bus a
+     * given slot event belongs to from the number alone) - only the two
+     * call-site markers below, which mark a genuinely different hook
+     * (writei vs readi) rather than just a different slot, get their own
+     * codes. */
+    AI_EVT_FIRST_WRITE,
+    AI_EVT_WRITEI,
 };
 
 typedef struct {
@@ -195,6 +206,8 @@ static const char *ai_evt_name(uint16_t code)
         case AI_EVT_TRIM:           return "TRIM_SLOT_SKIPFRAMES";
         case AI_EVT_UNDERRUN:       return "UNDERRUN_SLOT_AVAIL";
         case AI_EVT_BG_WAKE:        return "BG_WAKE_TICK";
+        case AI_EVT_FIRST_WRITE:    return "FIRST_WRITE_TAP_CLAIMED";
+        case AI_EVT_WRITEI:         return "WRITEI_SLOT_FRAMES";
         default:                    return "?";
     }
 }
@@ -205,7 +218,7 @@ static const char *ai_evt_name(uint16_t code)
 static void ai_dump_events(void)
 {
     char path[64];
-    snprintf(path, sizeof(path), "/tmp/forceAudioIn.dump.%d", (int)getpid());
+    snprintf(path, sizeof(path), "/tmp/forceAudioJack.dump.%d", (int)getpid());
     FILE *f = fopen(path, "w");
     if (!f) return;
 
@@ -213,7 +226,7 @@ static void ai_dump_events(void)
     uint64_t count = next < AI_EVT_CAP ? next : AI_EVT_CAP;
     uint64_t start = next < AI_EVT_CAP ? 0 : next;   /* oldest surviving slot, if the ring has wrapped */
 
-    fprintf(f, "# forceAudioIn event dump - pid %d, %llu events (capacity %u)\n",
+    fprintf(f, "# forceAudioJack event dump - pid %d, %llu events (capacity %u)\n",
             (int)getpid(), (unsigned long long)count, AI_EVT_CAP);
     fprintf(f, "# ts_ns tid event d16 d32\n");
 
@@ -225,12 +238,13 @@ static void ai_dump_events(void)
                 (unsigned long long)e->ts_ns, e->tid, ai_evt_name(e->code), e->d16, e->d32);
     }
     fclose(f);
-    ai_log("[forceAudioIn] event dump written to %s (%llu events)", path, (unsigned long long)count);
+    ai_log("[forceAudioJack] event dump written to %s (%llu events)", path, (unsigned long long)count);
 }
 
 /* ---- originals ----------------------------------------------------------*/
 static snd_pcm_sframes_t (*orig_readi)(snd_pcm_t *, void *, snd_pcm_uframes_t);
 static snd_pcm_sframes_t (*orig_readn)(snd_pcm_t *, void **, snd_pcm_uframes_t);
+static snd_pcm_sframes_t (*orig_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t);
 static int (*orig_hw_params)(snd_pcm_t *, snd_pcm_hw_params_t *);
 
 static int (*q_get_format)(const snd_pcm_hw_params_t *, int *);
@@ -247,6 +261,25 @@ static unsigned  g_n_attached = 0;   /* how many of g_shm[] are non-NULL, for lo
 static ino_t     g_shm_ino[AI_MAX_VOICES];  /* inode of the segment each slot is currently
                                               * mapped to - only ever read/written from the
                                               * background thread, see ai_try_attach below */
+
+/* Out-bus (physical Out 3/4 injection) - same shape as the In-bus state
+ * above, distinct arrays/namespace (see AI_SHM_NAME_FMT_OUT in
+ * forceAudioInject.h). Kept as parallel arrays rather than widening the
+ * existing ones to AI_MAX_VOICES+AI_MAX_OUT_VOICES so every existing
+ * In-bus call site (mix_in, the diagnostics loop, the test suite) keeps
+ * indexing g_shm[] exactly as it always has, with zero risk of an
+ * off-by-one dragging an out-bus slot into the in-bus mix path by mistake. */
+static ai_shm_t *g_shm_out[AI_MAX_OUT_VOICES];
+static unsigned  g_n_attached_out = 0;
+static ino_t     g_shm_out_ino[AI_MAX_OUT_VOICES];
+
+/* Skipback extraction ring - forceAudioJack.so is the PRODUCER here (see
+ * forceAudioJackExtract.h). skipbackHost creates the segment on demand (its
+ * own Modules-page toggle, same rule as every voice host); this is the
+ * lazy-attach state for it, same shape as the arrays above but singular -
+ * there is exactly one skipback consumer, not a slotted array of voices. */
+static ax_shm_t *g_ax_skipback = NULL;
+static ino_t     g_ax_skipback_ino;
 
 /* Bounding latency needs HYSTERESIS, not a hard ceiling: a persistent tiny
  * clock-rate mismatch between the producer's wall-clock timer and this
@@ -277,6 +310,8 @@ static ino_t     g_shm_ino[AI_MAX_VOICES];  /* inode of the segment each slot is
 
 static uint64_t g_trim_events[AI_MAX_VOICES];   /* diagnostics only, read/logged from diag_main */
 static uint64_t g_trim_frames[AI_MAX_VOICES];
+static uint64_t g_trim_events_out[AI_MAX_OUT_VOICES];
+static uint64_t g_trim_frames_out[AI_MAX_OUT_VOICES];
 
 /* ---- per-handle capture shape, same pattern as forceStream.so's g_pcms[] */
 #define MAX_PCMS 8
@@ -287,9 +322,11 @@ static struct {
     volatile uint64_t frames;
 } g_caps[MAX_PCMS];
 static volatile void *g_tap_pcm = NULL;   /* the one capture handle we mix into */
+static volatile void *g_tap_pcm_out = NULL;   /* the one playback handle we inject into */
 
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static volatile int g_announce_claim = 0;
+static volatile int g_announce_claim_out = 0;
 
 static void ai_log(const char *fmt, ...)
 {
@@ -345,6 +382,7 @@ static void ai_resolve(void)
 {
     orig_readi     = dlsym(RTLD_NEXT, "snd_pcm_readi");
     orig_readn     = dlsym(RTLD_NEXT, "snd_pcm_readn");
+    orig_writei    = dlsym(RTLD_NEXT, "snd_pcm_writei");
     orig_hw_params = dlsym(RTLD_NEXT, "snd_pcm_hw_params");
     q_get_format   = dlsym(RTLD_NEXT, "snd_pcm_hw_params_get_format");
     q_get_channels = dlsym(RTLD_NEXT, "snd_pcm_hw_params_get_channels");
@@ -378,27 +416,38 @@ static inline void ensure_init(void) { pthread_once(&g_once, ai_resolve); }
  * this file's whole design keeps syscalls (munmap included) off that hot
  * path; leaking one ~512KB mapping per voice-restart is a deliberate,
  * bounded tradeoff against ever risking a use-after-unmap there. */
-static void ai_try_attach(unsigned slot)
+/* Generic attach/re-attach for one bus's array of slots. `is_out` only
+ * controls which shm namespace to look in (ai_shm_name vs ai_shm_name_out)
+ * and the event-trace slot offset (see AI_EVT_FIRST_WRITE's comment above) -
+ * everything else (identity-by-inode re-attach, never munmap'ing the old
+ * mapping, publishing the pointer last with release semantics) is identical
+ * between the two buses. */
+static void ai_try_attach_generic(unsigned slot, ai_shm_t **shm_arr, ino_t *ino_arr,
+                                   unsigned *attached_counter, int is_out)
 {
-    ai_evt(AI_EVT_ATTACH_TRY, (uint16_t)slot, 0);
+    uint16_t evt_slot = (uint16_t)(slot + (is_out ? AI_MAX_VOICES : 0));
+    ai_evt(AI_EVT_ATTACH_TRY, evt_slot, 0);
 
     char name[24];
-    ai_shm_name(slot, name, sizeof(name));
+    if (is_out) ai_shm_name_out(slot, name, sizeof(name));
+    else        ai_shm_name(slot, name, sizeof(name));
 
-    /* ai_shm_name() returns a name like "/forceAudioInject0" - POSIX shm
-     * objects are visible by that same leaf name under /dev/shm, so a plain
-     * stat-by-path is enough to check identity without opening anything. */
+    /* ai_shm_name()/ai_shm_name_out() return a name like
+     * "/forceAudioInject0" or "/forceAudioJackOut0" - POSIX shm objects are
+     * visible by that same leaf name under /dev/shm, so a plain stat-by-path
+     * is enough to check identity without opening anything. */
     char path[40];
     snprintf(path, sizeof(path), "/dev/shm%s", name);
     struct stat st;
     int have_stat = (stat(path, &st) == 0);
 
-    ai_shm_t *cur = __atomic_load_n(&g_shm[slot], __ATOMIC_ACQUIRE);
+    ai_shm_t *cur = __atomic_load_n(&shm_arr[slot], __ATOMIC_ACQUIRE);
     int is_reattach = (cur != NULL);
     if (cur) {
-        if (!have_stat || st.st_ino == g_shm_ino[slot]) return;  /* unchanged, or gone - nothing to do */
-        ai_log("[forceAudioIn] voice slot %u's ring was replaced (inode %llu -> %llu) - re-attaching",
-               slot, (unsigned long long)g_shm_ino[slot], (unsigned long long)st.st_ino);
+        if (!have_stat || st.st_ino == ino_arr[slot]) return;  /* unchanged, or gone - nothing to do */
+        ai_log("[forceAudioJack] %s slot %u's ring was replaced (inode %llu -> %llu) - re-attaching",
+               is_out ? "out-bus voice" : "voice", slot,
+               (unsigned long long)ino_arr[slot], (unsigned long long)st.st_ino);
     } else if (!have_stat) {
         return;   /* not present yet - not an error, just try again next cycle */
     }
@@ -408,26 +457,83 @@ static void ai_try_attach(unsigned slot)
     void *m = mmap(NULL, AI_SHM_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (m == MAP_FAILED) {
-        ai_log("[forceAudioIn] mmap failed for %s - voice slot %u passthrough-only", name, slot);
+        ai_log("[forceAudioJack] mmap failed for %s - %s slot %u passthrough-only",
+               name, is_out ? "out-bus voice" : "voice", slot);
         return;
     }
     ai_shm_t *shm = (ai_shm_t *)m;
     if (shm->magic != AI_MAGIC) {
-        ai_log("[forceAudioIn] bad magic in %s - ignoring", name);
+        ai_log("[forceAudioJack] bad magic in %s - ignoring", name);
         munmap(m, AI_SHM_BYTES);
         return;
     }
 
     /* Publish the pointer LAST, with release semantics, only after the
-     * struct is fully mapped and magic-verified - mix_in() on the audio
-     * thread loads g_shm[slot] with acquire semantics (see below), so it
-     * either sees NULL/the old valid pointer, or the new fully-valid one,
-     * never a half-published one. */
-    g_shm_ino[slot] = st.st_ino;
-    __atomic_store_n(&g_shm[slot], shm, __ATOMIC_RELEASE);
-    if (!cur) __atomic_fetch_add(&g_n_attached, 1, __ATOMIC_RELAXED);
-    ai_evt(is_reattach ? AI_EVT_REATTACHED : AI_EVT_ATTACHED, (uint16_t)slot, (uint32_t)st.st_ino);
-    ai_log("[forceAudioIn] voice slot %u attached: %s, %u Hz, %u ch", slot, name, shm->rate, shm->channels);
+     * struct is fully mapped and magic-verified - mix_in()/mix_out() on the
+     * audio thread load shm_arr[slot] with acquire semantics, so they either
+     * see NULL/the old valid pointer, or the new fully-valid one, never a
+     * half-published one. */
+    ino_arr[slot] = st.st_ino;
+    __atomic_store_n(&shm_arr[slot], shm, __ATOMIC_RELEASE);
+    if (!cur) __atomic_fetch_add(attached_counter, 1, __ATOMIC_RELAXED);
+    ai_evt(is_reattach ? AI_EVT_REATTACHED : AI_EVT_ATTACHED, evt_slot, (uint32_t)st.st_ino);
+    ai_log("[forceAudioJack] %s slot %u attached: %s, %u Hz, %u ch",
+           is_out ? "out-bus voice" : "voice", slot, name, shm->rate, shm->channels);
+}
+
+static inline void ai_try_attach(unsigned slot)
+{
+    ai_try_attach_generic(slot, g_shm, g_shm_ino, &g_n_attached, 0);
+}
+
+static inline void ai_try_attach_out(unsigned slot)
+{
+    ai_try_attach_generic(slot, g_shm_out, g_shm_out_ino, &g_n_attached_out, 1);
+}
+
+/* Attach (or re-attach) the skipback extraction ring. Same identity-by-inode
+ * re-attach logic as ai_try_attach_generic above (skipbackHost restarting is
+ * exactly analogous to a voice host restarting: it may shm_unlink()+recreate
+ * on every start), just for a single fixed segment where forceAudioJack.so is
+ * the PRODUCER instead of the consumer - so there's no "voice enabled/gain"
+ * state to read, only the ring header and rate/channels. */
+static void ax_try_attach_skipback(void)
+{
+    const char *name = AX_SHM_NAME_SKIPBACK;
+    char path[48];
+    snprintf(path, sizeof(path), "/dev/shm%s", name);
+    struct stat st;
+    int have_stat = (stat(path, &st) == 0);
+
+    ax_shm_t *cur = __atomic_load_n(&g_ax_skipback, __ATOMIC_ACQUIRE);
+    int is_reattach = (cur != NULL);
+    if (cur) {
+        if (!have_stat || st.st_ino == g_ax_skipback_ino) return;
+        ai_log("[forceAudioJack] skipback ring was replaced (inode %llu -> %llu) - re-attaching",
+               (unsigned long long)g_ax_skipback_ino, (unsigned long long)st.st_ino);
+    } else if (!have_stat) {
+        return;   /* skipbackHost not running - not an error, just try again next cycle */
+    }
+
+    int fd = shm_open(name, O_RDWR, 0666);
+    if (fd < 0) return;
+    void *m = mmap(NULL, AX_SHM_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) {
+        ai_log("[forceAudioJack] mmap failed for %s - skipback passthrough-only", name);
+        return;
+    }
+    ax_shm_t *ax = (ax_shm_t *)m;
+    if (ax->magic != AX_MAGIC) {
+        ai_log("[forceAudioJack] bad magic in %s - ignoring", name);
+        munmap(m, AX_SHM_BYTES);
+        return;
+    }
+
+    g_ax_skipback_ino = st.st_ino;
+    __atomic_store_n(&g_ax_skipback, ax, __ATOMIC_RELEASE);
+    ai_log("[forceAudioJack] skipback ring %s: %s, %u Hz, %u ch",
+           is_reattach ? "re-attached" : "attached", name, ax->rate, ax->channels);
 }
 
 /* Background thread: three jobs, all off the hot path:
@@ -468,20 +574,28 @@ static void *bg_main(void *unused)
         unsigned slot;
         for (slot = 0; slot < AI_MAX_VOICES; slot++)
             ai_try_attach(slot);
+        for (slot = 0; slot < AI_MAX_OUT_VOICES; slot++)
+            ai_try_attach_out(slot);
+        ax_try_attach_skipback();
 
         if (access(AI_DIAG_MARKER, F_OK) != 0) continue;
 
         if (g_announce_claim) {
             g_announce_claim = 0;
-            ai_log("[forceAudioIn] tapping capture handle");
+            ai_log("[forceAudioJack] tapping capture handle");
+        }
+        if (g_announce_claim_out) {
+            g_announce_claim_out = 0;
+            ai_log("[forceAudioJack] tapping playback handle (out-bus)");
         }
         int i;
         for (i = 0; i < MAX_PCMS; i++) {
             if (!g_caps[i].pcm) continue;
-            ai_log("[forceAudioIn] handle %d: %u ch %u Hz, %llu frames read (%s)",
+            ai_log("[forceAudioJack] handle %d: %u ch %u Hz, %llu frames (%s)",
                    i, g_caps[i].channels, g_caps[i].rate,
                    (unsigned long long)g_caps[i].frames,
-                   (g_caps[i].pcm == g_tap_pcm) ? "TAPPED" : "idle");
+                   (g_caps[i].pcm == g_tap_pcm) ? "TAPPED-IN" :
+                   (g_caps[i].pcm == g_tap_pcm_out) ? "TAPPED-OUT" : "idle");
         }
         for (i = 0; i < AI_MAX_VOICES; i++) {
             ai_shm_t *shm = __atomic_load_n(&g_shm[i], __ATOMIC_ACQUIRE);
@@ -489,7 +603,7 @@ static void *bg_main(void *unused)
             uint32_t h = __atomic_load_n(&shm->head, __ATOMIC_ACQUIRE);
             uint32_t t = shm->tail;
             uint32_t backlog = (h - t) & (AI_RING_FRAMES - 1);
-            ai_log("[forceAudioIn] voice %d: backlog %u frames (%.1fms) trims %llu ev/%llu fr, "
+            ai_log("[forceAudioJack] voice %d: backlog %u frames (%.1fms) trims %llu ev/%llu fr, "
                    "enabled=%u gain=%.3f chan=%u, %u Hz %u ch, produced %llu consumed %llu underruns %llu",
                    i, backlog, backlog * 1000.0 / (shm->rate ? shm->rate : 44100),
                    (unsigned long long)g_trim_events[i], (unsigned long long)g_trim_frames[i],
@@ -497,6 +611,36 @@ static void *bg_main(void *unused)
                    (unsigned long long)shm->frames_written,
                    (unsigned long long)shm->frames_consumed,
                    (unsigned long long)shm->underruns);
+        }
+        for (i = 0; i < AI_MAX_OUT_VOICES; i++) {
+            ai_shm_t *shm = __atomic_load_n(&g_shm_out[i], __ATOMIC_ACQUIRE);
+            if (!shm) continue;
+            uint32_t h = __atomic_load_n(&shm->head, __ATOMIC_ACQUIRE);
+            uint32_t t = shm->tail;
+            uint32_t backlog = (h - t) & (AI_RING_FRAMES - 1);
+            ai_log("[forceAudioJack] out-bus voice %d: backlog %u frames (%.1fms) trims %llu ev/%llu fr, "
+                   "enabled=%u gain=%.3f chan=%u, %u Hz %u ch, produced %llu consumed %llu underruns %llu",
+                   i, backlog, backlog * 1000.0 / (shm->rate ? shm->rate : 44100),
+                   (unsigned long long)g_trim_events_out[i], (unsigned long long)g_trim_frames_out[i],
+                   shm->enabled, shm->gain, shm->channel_mask, shm->rate, shm->channels,
+                   (unsigned long long)shm->frames_written,
+                   (unsigned long long)shm->frames_consumed,
+                   (unsigned long long)shm->underruns);
+        }
+        {
+            ax_shm_t *ax = __atomic_load_n(&g_ax_skipback, __ATOMIC_ACQUIRE);
+            if (ax) {
+                uint32_t h = __atomic_load_n(&ax->head, __ATOMIC_ACQUIRE);
+                uint32_t t = ax->tail;
+                uint32_t backlog = (h - t) & (AX_RING_FRAMES - 1);
+                ai_log("[forceAudioJack] skipback ring: backlog %u frames (%.1fms), %u Hz %u ch, "
+                       "produced %llu consumed %llu overruns %llu",
+                       backlog, backlog * 1000.0 / (ax->rate ? ax->rate : 44100),
+                       ax->rate, ax->channels,
+                       (unsigned long long)ax->frames_written,
+                       (unsigned long long)ax->frames_consumed,
+                       (unsigned long long)ax->overruns);
+            }
         }
     }
     return NULL;
@@ -529,7 +673,7 @@ static void *bg_main(void *unused)
  * default, unchanged behavior). Same file-not-env-var reasoning as
  * AI_DIAG_MARKER - no practical way to set an env var in MPC's own exec
  * environment. */
-#define AI_CTOR_DELAY_MARKER "/tmp/forceAudioIn.delay"
+#define AI_CTOR_DELAY_MARKER "/tmp/forceAudioJack.delay"
 
 static void ai_maybe_delay(void)
 {
@@ -542,7 +686,7 @@ static void ai_maybe_delay(void)
         if (v > 0) ms = v;
     }
     fclose(f);
-    ai_log("[forceAudioIn] AI_CTOR_DELAY_MARKER present - delaying constructor %ldms before any attach work", ms);
+    ai_log("[forceAudioJack] AI_CTOR_DELAY_MARKER present - delaying constructor %ldms before any attach work", ms);
     ai_evt(AI_EVT_CTOR_DELAY, 0, (uint32_t)ms);
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
@@ -553,12 +697,15 @@ static void ai_ctor(void)
 {
     ai_evt(AI_EVT_CTOR_START, 0, 0);
     ai_maybe_delay();
-    ai_log("[forceAudioIn] loaded into pid %d", (int)getpid());
+    ai_log("[forceAudioJack] loaded into pid %d", (int)getpid());
 
     unsigned slot;
     for (slot = 0; slot < AI_MAX_VOICES; slot++)
         ai_try_attach(slot);
-    ai_log("[forceAudioIn] %u voice(s) attached at load", g_n_attached);
+    for (slot = 0; slot < AI_MAX_OUT_VOICES; slot++)
+        ai_try_attach_out(slot);
+    ax_try_attach_skipback();
+    ai_log("[forceAudioJack] %u voice(s) attached at load (%u out-bus)", g_n_attached, g_n_attached_out);
     ai_evt(AI_EVT_CTOR_DONE, 0, g_n_attached);
 
     /* Unconditional, unlike before: this thread now also does lazy
@@ -690,6 +837,143 @@ static inline void mix_in(unsigned char *buffer, size_t frames,
     }
 }
 
+/* Is physical output channel `c` one this out-bus voice should land on,
+ * given its `mask`? Confirmed live (192.168.1.187): the tapped playback
+ * handle is a 4-channel interleaved PCM where channels 0/1 are MPC's own
+ * main mix and channels 2/3 are the physical Out 3/4 jacks - unlike
+ * chan_allowed() above (which maps onto whichever 1/2-channel capture shape
+ * MPC configured), this is NOT relative to dst_channels: channels 0/1 must
+ * never be touched by an out-bus voice regardless of dst_channels, and
+ * channels 2/3 are the only valid targets. AI_CHAN_L/AI_CHAN_R mean "Out
+ * 3"/"Out 4" here (see forceAudioInject.h). Fails closed if the handle
+ * somehow isn't the confirmed 4-channel shape (checked by the caller before
+ * this is ever reached) - there is no channel 2/3 to inject into otherwise. */
+static inline int chan_allowed_out(unsigned c, uint32_t mask)
+{
+    if (c == 2) return (mask & AI_CHAN_L) != 0;
+    if (c == 3) return (mask & AI_CHAN_R) != 0;
+    return 0;   /* channels 0/1 (MPC's own main mix) are never touched */
+}
+
+/* Out-bus equivalent of mix_in_one: same SPSC ring draining/latency-trim/
+ * underrun mechanics (see mix_in_one for the rationale, identical here),
+ * but adds into `buffer` BEFORE it's handed to the real snd_pcm_writei
+ * rather than after a real read - by the time a real write returns, the
+ * samples are already gone to hardware, so out-bus injection has to happen
+ * on the way in, not the way out. `buffer` holds MPC's own real playback
+ * audio (channels 0/1) plus whatever earlier out-bus voices in this call
+ * already added into channels 2/3. */
+static inline void mix_out_one(unsigned slot, ai_shm_t *shm, unsigned char *buffer, size_t frames,
+                               unsigned dst_channels, unsigned dst_frame_bytes, int dst_format)
+{
+    if (!shm || !frames || dst_channels < 4) return;
+
+    uint32_t head = __atomic_load_n(&shm->head, __ATOMIC_ACQUIRE);
+    uint32_t tail = shm->tail;                          /* we are the only consumer */
+    uint32_t avail = (head - tail) & (AI_RING_FRAMES - 1);
+    uint16_t evt_slot = (uint16_t)(slot + AI_MAX_VOICES);
+    ai_evt(AI_EVT_MIX_ONE, evt_slot, avail);
+
+    if (avail > AI_LATENCY_TRIGGER_FRAMES) {
+        uint32_t skip = avail - AI_LATENCY_TARGET_FRAMES;
+        tail = (tail + skip) & (AI_RING_FRAMES - 1);
+        avail = AI_LATENCY_TARGET_FRAMES;
+        g_trim_events_out[slot]++;
+        g_trim_frames_out[slot] += skip;
+        ai_evt(AI_EVT_TRIM, evt_slot, skip);
+    }
+
+    uint32_t take = (uint32_t)frames;
+    if (take > avail) {
+        shm->underruns++;
+        take = avail;
+        ai_evt(AI_EVT_UNDERRUN, evt_slot, avail);
+    }
+    if (!take) return;
+
+    uint32_t enabled = shm->enabled;
+    if (enabled) {
+        float gain = shm->gain;
+        uint32_t mask = shm->channel_mask;
+        unsigned src_ch = shm->channels ? shm->channels : 1;
+        unsigned dw = width_of(dst_format);
+        uint32_t i;
+
+        for (i = 0; i < take; i++) {
+            uint32_t ring_frame = (tail + i) & (AI_RING_FRAMES - 1);
+            const float *src = &shm->ring[(size_t)ring_frame * AI_MAX_CH];
+
+            unsigned c;
+            for (c = 2; c < dst_channels && c < 4; c++) {
+                if (!chan_allowed_out(c, mask)) continue;
+                float sv = (src_ch >= 2) ? src[c % src_ch] : src[0];
+                sv *= gain;
+                size_t off = (size_t)i * dst_frame_bytes + (size_t)c * dw;
+                float real = sample_to_float(buffer, off, dst_format);
+                float_to_sample(buffer, off, dst_format, real + sv);
+            }
+        }
+    }
+
+    __atomic_store_n(&shm->tail, (tail + take) & (AI_RING_FRAMES - 1), __ATOMIC_RELEASE);
+    shm->frames_consumed += take;
+}
+
+/* Sums every attached out-bus voice into `buffer`'s channels 2/3 - see
+ * mix_out_one for the per-voice mechanics. Called from snd_pcm_writei
+ * BEFORE the real write, unlike mix_in which runs after the real read. */
+static inline void mix_out(unsigned char *buffer, size_t frames,
+                           unsigned dst_channels, unsigned dst_frame_bytes, int dst_format)
+{
+    if (!__atomic_load_n(&g_n_attached_out, __ATOMIC_RELAXED) || !frames || dst_channels < 4) return;
+    unsigned slot;
+    for (slot = 0; slot < AI_MAX_OUT_VOICES; slot++) {
+        ai_shm_t *shm = __atomic_load_n(&g_shm_out[slot], __ATOMIC_ACQUIRE);
+        if (shm)
+            mix_out_one(slot, shm, buffer, frames, dst_channels, dst_frame_bytes, dst_format);
+    }
+}
+
+/* Copies `frames` frames of MPC's own real main-mix audio (channels 0/1 of
+ * `buffer`, which by this point already includes any out-bus injection into
+ * 2/3, irrelevant here since those are different channels) into the
+ * skipback extraction ring. Called from snd_pcm_writei AFTER the real write
+ * succeeds - see the "producer never blocks" overrun policy in
+ * forceAudioJackExtract.h. `src_channels`/`src_frame_bytes`/`src_format`
+ * describe `buffer`'s real shape (the confirmed 4-channel ADA2 handle in
+ * practice), not the extraction ring's fixed AX_CHANNELS=2 shape. */
+static inline void ax_extract_skipback(const unsigned char *buffer, size_t frames,
+                                       unsigned src_channels, unsigned src_frame_bytes, int src_format)
+{
+    ax_shm_t *ax = __atomic_load_n(&g_ax_skipback, __ATOMIC_ACQUIRE);
+    if (!ax || !frames || src_channels < 1) return;
+
+    uint32_t head = ax->head;   /* we are the sole producer */
+    uint32_t tail = __atomic_load_n(&ax->tail, __ATOMIC_ACQUIRE);
+    uint32_t backlog = (head - tail) & (AX_RING_FRAMES - 1);
+    uint32_t space = (AX_RING_FRAMES - 1) - backlog;
+
+    unsigned dw = width_of(src_format);
+    uint32_t i;
+    for (i = 0; i < frames; i++) {
+        uint32_t fr = (head + (uint32_t)i) & (AX_RING_FRAMES - 1);
+        float *dst = &ax->ring[(size_t)fr * AX_CHANNELS];
+        size_t off = (size_t)i * src_frame_bytes;
+        float l = sample_to_float(buffer, off, src_format);
+        float r = (src_channels >= 2) ? sample_to_float(buffer, off + dw, src_format) : l;
+        dst[0] = l;
+        dst[1] = r;
+    }
+
+    /* Producer never blocks: if skipbackHost has fallen more than a full
+     * ring lap behind, we've just overwritten frames it never read - log it
+     * as an overrun rather than ever waiting on the consumer. */
+    if ((uint32_t)frames > space) ax->overruns += ((uint32_t)frames - space);
+
+    __atomic_store_n(&ax->head, (head + (uint32_t)frames) & (AX_RING_FRAMES - 1), __ATOMIC_RELEASE);
+    ax->frames_written += frames;
+}
+
 int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
     ensure_init();
@@ -713,7 +997,10 @@ int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
                 g_caps[slot].format = fmt;
                 g_caps[slot].frame_bytes = ch * width_of(fmt);
             }
-            ai_log("[forceAudioIn] configured capture %s: %u Hz, %u ch, fmt %d (%u B/frame)",
+            /* Generic across both directions - this hook fires for MPC's
+             * playback handle too now (out-bus injection), not just capture
+             * as before, so the log no longer assumes which one. */
+            ai_log("[forceAudioJack] configured handle %s: %u Hz, %u ch, fmt %d (%u B/frame)",
                    (q_pcm_name && pcm) ? q_pcm_name(pcm) : "?", rate, ch, fmt, ch * width_of(fmt));
             ai_evt(AI_EVT_HW_PARAMS, (uint16_t)ch, rate);
         }
@@ -757,4 +1044,51 @@ snd_pcm_sframes_t snd_pcm_readn(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t s
      * in practice, and mixing per-plane here would cost more than it's
      * worth on the audio thread until proven otherwise. */
     return orig_readn(pcm, bufs, size);
+}
+
+/* Out-bus injection tap. Unlike snd_pcm_readi (mix AFTER the real read,
+ * into the result buffer), injection here has to happen BEFORE the real
+ * write - once orig_writei returns, these samples are already gone to
+ * hardware, so there's no "after" to mix into. `buffer` is `const` per
+ * ALSA's own API (the caller, MPC, doesn't expect it mutated), but casting
+ * that away and adding into it in place is safe here: MPC hands this buffer
+ * to snd_pcm_writei purely to be written to the codec and never reads it
+ * back afterward (same assumption force-link-audio's forceStream.so already
+ * relies on for its own writei hook, just reading rather than mutating). */
+snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
+{
+    ensure_init();
+    if (!orig_writei) return -1;
+
+    if (size > 0) {
+        int i, slot = -1;
+        for (i = 0; i < MAX_PCMS; i++)
+            if (g_caps[i].pcm == (void *)pcm) { slot = i; break; }
+
+        if (slot >= 0) {
+            g_caps[slot].frames += (uint64_t)size;
+
+            if (!g_tap_pcm_out) {
+                g_tap_pcm_out = (void *)pcm;
+                g_announce_claim_out = 1;
+                ai_evt(AI_EVT_FIRST_WRITE, (uint16_t)slot, (uint32_t)size);
+            }
+            if ((void *)pcm == g_tap_pcm_out) {
+                ai_evt(AI_EVT_WRITEI, (uint16_t)slot, (uint32_t)size);
+                mix_out((unsigned char *)buffer, (size_t)size,
+                        g_caps[slot].channels, g_caps[slot].frame_bytes, g_caps[slot].format);
+            }
+        }
+
+        snd_pcm_sframes_t r = orig_writei(pcm, buffer, size);
+
+        /* Extraction happens AFTER the real write succeeds (mirrors readi's
+         * own r>0 check) - only count audio that actually made it to
+         * hardware, and only from the one handle we're tapping. */
+        if (r > 0 && slot >= 0 && (void *)pcm == g_tap_pcm_out)
+            ax_extract_skipback((const unsigned char *)buffer, (size_t)r,
+                                 g_caps[slot].channels, g_caps[slot].frame_bytes, g_caps[slot].format);
+        return r;
+    }
+    return orig_writei(pcm, buffer, size);
 }

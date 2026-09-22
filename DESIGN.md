@@ -1,9 +1,16 @@
-# force-audioin — Technical Design & Architecture
+# force-audio-jack — Technical Design & Architecture
 
-This document explains **how** force-audioin works, for anyone
+This document explains **how** force-audio-jack works, for anyone
 maintaining it, porting it to a different device/firmware revision, or
 building a new voice-producing add-on that injects audio through it.
 For installation and everyday use, see [README.md](README.md).
+
+**Scope note**: this document describes the original, stable In-bus
+(Audio-In 1/2) injection tap — everything below is shipped and verified
+on real hardware. The newer Out-bus (physical Out 3/4) injection and
+Skipback features are documented separately in
+[docs/PROPOSAL-force-audio-jack.md](docs/PROPOSAL-force-audio-jack.md),
+since they're unit-tested but not yet verified on real hardware.
 
 ## Contents
 
@@ -44,7 +51,7 @@ mockbamod-module-creator skill's own gotchas reference ranks
 citing `mockbaMagic` as the example — **raw in-memory binary patching
 at addresses from a table keyed to an exact firmware version**.
 
-force-audioin uses a meaningfully different, lower-risk technique:
+force-audio-jack uses a meaningfully different, lower-risk technique:
 **symbol interposition** against `libasound`'s stable public ABI.
 
 ```c
@@ -76,7 +83,7 @@ load time, never on the audio thread.
 your synth/generator process (any language, e.g. maze_host)
         │  renders audio, writes into a POSIX shared-memory ring
         ▼
-forceAudioIn.so (LD_PRELOAD'd into /usr/bin/MPC)
+forceAudioJack.so (LD_PRELOAD'd into /usr/bin/MPC)
         │  interposes snd_pcm_readi by symbol name (dlsym(RTLD_NEXT, ...))
         │  mixes (sums, never replaces) up to 4 simultaneous voice rings
         │  into whatever real hardware audio MPC reads
@@ -93,7 +100,7 @@ the SPSC (single-producer/single-consumer) atomics correctly for one
 producer process and one consumer thread inside MPC.
 
 The producer always writes 32-bit float, mono or stereo, at a fixed
-rate it declares in the ring's own header — `forceAudioIn.so` does the
+rate it declares in the ring's own header — `forceAudioJack.so` does the
 conversion to whatever format/channel count MPC actually configured on
 the real capture handle, so the producer never needs to know or care
 what MPC is doing.
@@ -111,11 +118,11 @@ its own slot's ring instead.
 
 ## Multi-voice mixing
 
-`forceAudioIn.so` mixes up to `AI_MAX_VOICES` (4) independent voice
+`forceAudioJack.so` mixes up to `AI_MAX_VOICES` (4) independent voice
 hosts at once, each in its own named shared-memory ring
 (`/forceAudioInject0`, `/forceAudioInject1`, ...). Every ring stays
 genuinely single-producer/single-consumer — one voice host writes its
-own ring; `forceAudioIn.so` is the sole reader of all of them — so this
+own ring; `forceAudioJack.so` is the sole reader of all of them — so this
 scales without adding any cross-process synchronization beyond what
 already exists per ring.
 
@@ -138,7 +145,7 @@ skips adding that voice's samples into the output — the ring is still
 drained at the normal rate, so a re-enabled voice resumes from live
 backlog, not a stale one.
 
-**`LD_PRELOAD` is armed once, not per voice.** `forceAudioIn.so` itself
+**`LD_PRELOAD` is armed once, not per voice.** `forceAudioJack.so` itself
 needs loading into MPC exactly once — it already attaches to every
 slot that has a ring present. A second or third simultaneous voice
 add-on just needs a distinct `--slot`; its own startup script must
@@ -156,7 +163,7 @@ and audibly mixed together correctly (`maze_host` on one slot,
 A voice host that's stopped and later restarted (toggled off/on via
 the Modules page) may very plausibly `shm_unlink()` and recreate its
 ring from scratch on every start ("start clean") — a **new inode under
-the same name**. `forceAudioIn.c`'s attach logic doesn't treat "already
+the same name**. `forceAudioJack.c`'s attach logic doesn't treat "already
 attached" as permanent: it `stat()`s the ring's path (cheap, off the
 hot path, from the same background thread that does lazy re-attach)
 and compares inodes, re-attaching if the segment was replaced.
@@ -189,7 +196,7 @@ A voice host's producer process should be started **only** on demand,
 via its own NSMODULE.json/nodeServer Modules-page toggle — never by a
 voice add-on's own boot script.
 
-- `run_ForceAudioIn.sh` **only arms `forceAudioIn.so`** at boot, with
+- `run_ForceAudioJack.sh` **only arms `forceAudioJack.so`** at boot, with
   zero voices ever attached at that point — proven safe across every
   repeated-restart test run against it, including a real physical
   reboot. It does not start any producer itself.
@@ -203,7 +210,7 @@ voice add-on's own boot script.
   (same toggle). Extensive live testing found that restarting `acvs`
   while *any* voice ring is attached can reliably kill pads/buttons
   (occasionally Wi-Fi) — with no known-safe way to do it on purpose
-  yet. `forceAudioIn.so` armed with zero voices, by contrast, has never
+  yet. `forceAudioJack.so` armed with zero voices, by contrast, has never
   failed a single test. See
   [Known limitations](#known-limitations) below for the investigation
   into the root cause.
@@ -229,7 +236,7 @@ textbook lost-update: whichever write lands last wins, silently
 dropping another script's entry.
 
 This bug is pre-existing in MockbaMod itself, not introduced by this
-add-on. **Mitigation applied here**: `run_ForceAudioIn.sh` and
+add-on. **Mitigation applied here**: `run_ForceAudioJack.sh` and
 `addon/manage.sh` wrap every read-modify-write of the shared
 `LD_PRELOAD` file in an `mkdir`-based mutex (atomic even on BusyBox;
 bounded retry, fails open rather than risking a hung boot on a stale
@@ -274,22 +281,22 @@ by the ring's own startup transient).
 
 ## Diagnostics
 
-Runtime logging is written to `/tmp/forceAudioIn.log` on request, via
-a plain marker file (`/tmp/forceAudioIn.diag` — checked because there's
+Runtime logging is written to `/tmp/forceAudioJack.log` on request, via
+a plain marker file (`/tmp/forceAudioJack.diag` — checked because there's
 no practical way to set an environment variable in MPC's own exec
 environment, since this library is loaded by a boot script rather than
 launched directly). When present, a background thread periodically
 logs per-voice backlog, gain, routing, and underrun counts.
 
 For deeper investigation, a lightweight **in-process event trace** is
-built directly into `forceAudioIn.c`: a fixed-size ring of 65,536 tiny
+built directly into `forceAudioJack.c`: a fixed-size ring of 65,536 tiny
 timestamped event records (constructor start, every attach/re-attach,
 every `snd_pcm_readi` call on the tapped handle, every per-voice mix,
 every trim and underrun), written with a single atomic increment and a
 `clock_gettime` call — no locks, no syscalls beyond the clock read, on
-the hot path. Touching `/tmp/forceAudioIn.dumpreq` makes the background
+the hot path. Touching `/tmp/forceAudioJack.dumpreq` makes the background
 thread dump the ring, in chronological order, to
-`/tmp/forceAudioIn.dump.<pid>`. Since MPC does not crash when pads go
+`/tmp/forceAudioJack.dump.<pid>`. Since MPC does not crash when pads go
 unresponsive — it stays running, just unresponsive — a dump can be
 requested well after a failure is physically confirmed, with nothing
 needing to be caught in flight.
