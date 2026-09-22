@@ -27,80 +27,70 @@ DrmVncServer's auto-launch is currently OFF.
 local repo. `manage.sh ENABLE` run once (arms `forceAudioJack.so`, cleans up
 any stale pre-rename `LD_PRELOAD` entry automatically).
 
-## 3. ACTIVE, most important finding: loading forceAudioJack.so crashes MPC
+## 3. RESOLVED: the cereal::RapidJSONException crash is NOT caused by this addon
 
-**This supersedes the "boot race" framing below** — kept for the historical
-trail, but the boot-timing angle was a red herring. Here's what's actually
-true, most-confirmed-first:
+Long investigation, short answer: **`forceAudioJack.so` does not cause
+this crash.** Confirmed via an actual core-dump analysis, not just
+behavioral correlation — see "How this was actually settled" below. The
+crash is a pre-existing MockbaMod/MPC-environment issue unrelated to
+force-audio-jack, and it's safe to have the tap enabled.
 
-**`forceAudioJack.so` loading into MPC is what triggers a 100% reproducible
-crash** (`terminate called after throwing an instance of
-'cereal::RapidJSONException'`, deep in MPC's own settings/project JSON
-loading, before MPC's own startup banner even prints). Confirmed via
-`/tmp/forceAudioJack.log`: every one of ~20 consecutive crashing PIDs in
-one run shows `[forceAudioJack] loaded into pid N`. This isn't a rare
-race — once the `.so` is actually loaded, the crash has followed every
-single time observed so far, regardless of *how* it got loaded.
+Two real, unrelated bugs were found and fixed along the way (both worth
+keeping regardless of the crash mystery):
 
-**Ruled out: constructor timing.** The library used to create its
-background thread from `__attribute__((constructor))` (library-load time,
-potentially concurrent with other libraries' own constructors/MPC's static
-initializers). Moved that work into `ai_resolve()`, lazily triggered by
-MPC's own first interposed ALSA call — guaranteed to run only after MPC's
-own startup is complete. The exact same crash still happened. So it's not
-about *when* relative to process startup; something else is wrong.
+- **`forceAudioJack.c`**: the library's `__attribute__((constructor))`
+  used to create a background thread at library-load time, potentially
+  concurrent with other libraries' own constructors. Moved that work into
+  `ai_resolve()`, lazily triggered by MPC's own first interposed ALSA
+  call — safer regardless of the crash investigation's outcome.
+- **`run_ForceAudioJack.sh`**: used to strip its own `LD_PRELOAD` entry on
+  every boot-triggered `kill` (not just DISABLE), re-entering the boot's
+  write race from scratch every single restart, unlike `mockbaMagic`/
+  `MidiLoop`'s own idempotent pattern (write only if not already present).
+  Fixed to match their pattern — this is what got the `.so` loading
+  reliably for the first time, which is what let the crash investigation
+  actually happen.
 
-**Leading hypothesis, not yet tested**: the *original* `forceAudioIn.so`
-(readi-only — no `snd_pcm_writei` interposition, no out-bus injection, no
-skipback extraction) ran in production for weeks with no sign of this.
-Today added the entire `writei` hook as genuinely new code. That's the
-most likely place a real bug lives.
+**How this was actually settled**: three separate `boot.sh` timing edits,
+and later a `writei`-hook bisection and an event-trace-ring-size
+bisection, all correlated with the same crash — but a live `/proc/maps`
+poll during one crash episode showed `forceAudioJack.so` wasn't even
+loaded in the crashing processes, undermining the whole premise. Settled
+it properly: enabled `/data/coredumps.enabled` (a real Akai coredump
+facility at `/usr/bin/az01-coredump`, undocumented but found via `strings`
+on the binary — writes `.core.zst`/`.log.zst`/`.metadata` to
+`/data/coredumps/`), pulled a genuine core file, and parsed it directly
+with Python (`readelf -n` for the mapping table, manual `struct.unpack`
+of the ARM `NT_PRSTATUS` notes — no `gdb`/`pyelftools` needed). Confirmed
+`forceAudioJack.so` WAS mapped into the crashing process, then scanned
+all 17 threads' stacks (64KB each) for any address inside its range —
+**zero hits, across every thread**. The crashing thread's PC/LR were both
+in `libc`'s own `abort()` (expected), and its stack showed real references
+to `libc`/`libstdc++`/`libfreetype`/`ld-linux`, and notably `MidiLoop`'s
+own `tkgl_anyctrl_lt.so` — but never `forceAudioJack.so`. The library was
+loaded but never part of the actual call chain. The day's "loading causes
+the crash" theory was a coincidence: both loading successfully and the
+pre-existing crash flaring up are likely downstream of the same thing
+(the day's extraordinary restart count), not one causing the other.
 
-**Next step**: bisect by disabling the `writei` hook (pass straight
-through, no mixing/extraction) and testing whether that loads cleanly. A
-clean load pins the bug to the new out-bus/extraction code; a crash even
-then rules out today's additions and points elsewhere.
-
-**Current device state**: `manage.sh DISABLE`'d — `forceAudioJack.so` is
-NOT in `LD_PRELOAD`. Safe, stable baseline. Don't re-enable without
-checking this section's latest state first.
-
----
-
-### Historical trail (superseded, kept for context)
-
-A real, separate bug was found and fixed along the way:
-`run_ForceAudioJack.sh`'s own retry loop never terminated (a variable-name
-collision between its own counter and `lock_preload()`'s internal one),
-leaving a permanently-running zombie process on every boot. Fixed by
-renaming the colliding variable.
-
-Also found and fixed: `run_ForceAudioJack.sh` used to strip its own
-`LD_PRELOAD` entry on every boot-triggered `kill` (not just DISABLE),
-re-entering the write race from scratch every single restart, unlike
-`mockbaMagic`/`MidiLoop`'s own idempotent pattern (write only if not
-already present). Fixed to match their pattern.
-
-Three separate `boot.sh` read-side timing fixes were tried and reverted
-after each correlated with the same crash loop — but that correlation
-turned out to be because each one *happened to get the `.so` loaded*, not
-because of anything about `boot.sh`'s own timing. Once the
-idempotent-persistence fix above got the `.so` loading reliably *without*
-touching `boot.sh` at all, the same crash still occurred every time,
-which is what revealed the real trigger. **`boot.sh` itself was very
-likely never the problem** — don't avoid editing it based on the earlier
-"4-for-4 correlation" framing without re-reading this section first.
+**Don't reflexively revert this addon's own changes** if this crash
+recurs — check `/proc/<pid>/maps` or pull a core dump first to confirm
+`forceAudioJack.so` is actually involved before assuming causation.
+`tkgl_anyctrl_lt.so`'s appearance on the crashing stack is a real lead for
+whoever chases the actual root cause, but that's `MidiLoop`'s own code,
+out of this project's scope. `/data/coredumps.enabled` was left in place
+on the device (harmless, useful for that future investigation) - the
+`/data/coredumps/` directory should be cleaned up periodically (each
+capture is 50-150MB).
 
 ## Remaining checklist before force-audio-jack is "finished" / releasable
 
 Nothing below has ever actually run on real hardware yet — do this as a
-calm, dedicated session, not appended to other troubleshooting:
+calm, dedicated session:
 
-- [ ] **Blocking everything else**: root-cause and fix the
-      `cereal::RapidJSONException` crash from section 3 above. Bisect the
-      `writei` hook first (see "Next step").
-- [ ] Once loading is crash-free: confirm `forceAudioJack.so` stays loaded
-      across a normal restart. Confirm via `/proc/<MPC-pid>/environ`.
+- [ ] Re-enable (`manage.sh ENABLE`) and confirm `forceAudioJack.so` loads
+      and stays loaded across a normal restart. Confirm via
+      `/proc/<MPC-pid>/environ`.
 - [ ] Confirm the original In-bus path still works exactly as before the
       rebrand: `injectTone --bus in`, hear/confirm it on an Audio-In track.
 - [ ] Out-bus: `injectTone --bus out`, confirm audio actually reaches the
