@@ -55,18 +55,32 @@
 #define DEFAULT_OUTPUT_DIR  "/sdcard/Force Documents/Samples/Skipback"
 #define DEFAULT_RATE        44100u
 
-/* Optional "now playing" override for the filename's name component,
- * in place of the project name lookup below - a generic convention any
- * addon can use, not something specific to one. Any addon that knows
- * what's actually playing (e.g. force-cratedigger, mid-Discogs-crate-dig
- * search result) writes one line of plain text here on track change and
- * removes the file on stop; skipbackHost doesn't care who wrote it or
- * why, just that it's recent. Tempo/bpm in the filename is UNCHANGED by
- * this - still the real project tempo from lookup_tempo() below, since
- * that's a meaningful "what tempo was I jamming at" value regardless of
- * what's playing back. Falls back to the project name exactly as before
- * if the file is missing, empty, or older than NOWPLAYING_MAX_AGE_SEC
- * (stale - e.g. the writer crashed or was killed without cleaning up). */
+/* Optional "now playing" override for the filename's name AND bpm
+ * components, in place of the project-name/project-tempo lookups below -
+ * a generic convention any addon can use, not something specific to one.
+ * Any addon that knows what's actually playing (e.g. force-cratedigger,
+ * mid-Discogs-crate-dig search result) writes up to two lines here on
+ * track change and removes the file on stop; skipbackHost doesn't care
+ * who wrote it or why, just that it's recent:
+ *   line 1: track name (required for the override to apply at all)
+ *   line 2: track-specific tempo/bpm, plain number (optional)
+ *
+ * IMPORTANT: once the override applies (a fresh line 1), the Force
+ * project's own tempo becomes IRRELEVANT and must never appear in the
+ * filename in its place - it's the sequencer's tempo, unrelated to
+ * whatever external track was actually playing, and showing it would
+ * misrepresent the recording. So: line 2 present and > 0 -> that tempo
+ * appears in the filename; line 2 absent/blank/<= 0 (e.g. Discogs
+ * releases carry no BPM data at all, so force-cratedigger's own
+ * crate-dig results usually won't set this line) -> the filename gets
+ * NO bpm segment at all, not the project tempo. See save_worker()'s own
+ * comment on the call site for exactly how that's kept separate from the
+ * ordinary (no override - ordinary studio jam) case, where the real
+ * project tempo is still exactly as meaningful as ever.
+ *
+ * Falls back entirely to the project name/tempo exactly as before if the
+ * file is missing, empty, or older than NOWPLAYING_MAX_AGE_SEC (stale -
+ * e.g. the writer crashed or was killed without cleaning up). */
 #define NOWPLAYING_OVERRIDE_PATH "/tmp/force_nowplaying.txt"
 #define NOWPLAYING_MAX_AGE_SEC   600
 
@@ -196,10 +210,15 @@ static double lookup_tempo(const char *xpj_path)
 
 /* Reads NOWPLAYING_OVERRIDE_PATH's first line into `name` (truncated to
  * name_len - 1, trailing newline stripped) if the file exists, is
- * non-empty, and was modified within NOWPLAYING_MAX_AGE_SEC. Returns 1
- * on a usable override, 0 otherwise (name left untouched - caller
- * already has the project-name fallback in it). */
-static int lookup_nowplaying_override(char *name, size_t name_len)
+ * non-empty, and was modified within NOWPLAYING_MAX_AGE_SEC. On success
+ * (returns 1), also checks a second line for a track-specific tempo: if
+ * present and it parses as a positive number, *tempo_out is set to it
+ * (overriding the caller's project-tempo default); otherwise *tempo_out
+ * is left untouched, so the caller's existing lookup_tempo() result
+ * still applies. Returns 0 (name and *tempo_out both untouched - caller
+ * already has the project-name/project-tempo fallbacks) if there's no
+ * usable override at all. */
+static int lookup_nowplaying_override(char *name, size_t name_len, double *tempo_out)
 {
     struct stat st;
     if (stat(NOWPLAYING_OVERRIDE_PATH, &st) != 0) return 0;
@@ -208,18 +227,26 @@ static int lookup_nowplaying_override(char *name, size_t name_len)
 
     FILE *f = fopen(NOWPLAYING_OVERRIDE_PATH, "r");
     if (!f) return 0;
-    char line[256] = "";
-    char *got = fgets(line, sizeof(line), f);
+    char line1[256] = "";
+    char line2[64] = "";
+    char *got1 = fgets(line1, sizeof(line1), f);
+    char *got2 = fgets(line2, sizeof(line2), f);
     fclose(f);
-    if (!got) return 0;
+    if (!got1) return 0;
 
-    size_t len = strcspn(line, "\r\n");
-    line[len] = '\0';
+    size_t len = strcspn(line1, "\r\n");
+    line1[len] = '\0';
     if (len == 0) return 0;
 
     if (len >= name_len) len = name_len - 1;
-    memcpy(name, line, len);
+    memcpy(name, line1, len);
     name[len] = '\0';
+
+    if (got2) {
+        line2[strcspn(line2, "\r\n")] = '\0';
+        double t = atof(line2);
+        if (t > 0.0) *tempo_out = t;
+    }
     return 1;
 }
 
@@ -306,11 +333,25 @@ static void *save_worker(void *unused)
     char project[128] = "Untitled";
     char xpj_path[400] = "";
     lookup_project_name(project, sizeof(project), xpj_path, sizeof(xpj_path));
-    /* A fresh now-playing override (see its own comment) replaces the
-     * project name in the filename; tempo below is unaffected either way. */
-    lookup_nowplaying_override(project, sizeof(project));
-    sanitize_for_filename(project);
     double tempo = lookup_tempo(xpj_path);
+
+    /* A fresh now-playing override (see its own comment) replaces the
+     * project name in the filename - and, once it does, the project
+     * tempo above is no longer relevant at all (it's the Force
+     * sequencer's own tempo, unrelated to whatever external track was
+     * actually playing) and must NOT leak into the filename just
+     * because no track-specific tempo was available either. So this
+     * looks up into a fresh 0.0, not into `tempo` directly: if the
+     * override applies, `tempo` becomes the track's own tempo when the
+     * source provided one, or 0.0 (which the write below already
+     * renders as "no bpm segment at all") when it didn't - never the
+     * unrelated project tempo. If the override doesn't apply (no fresh
+     * now-playing file - an ordinary, non-cratedigger recording),
+     * `tempo` is left as the real project lookup above, unchanged. */
+    double override_tempo = 0.0;
+    if (lookup_nowplaying_override(project, sizeof(project), &override_tempo))
+        tempo = override_tempo;
+    sanitize_for_filename(project);
 
     time_t now = time(NULL);
     struct tm tmv;
