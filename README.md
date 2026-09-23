@@ -14,11 +14,16 @@ renamed when Out 3/4 injection and Skipback were merged in.
 
 **Status: the original In-bus (Audio-In 1/2) injection tap is v1.0,
 stable on real Force hardware.** Out-bus (physical Out 3/4) injection
-and Skipback are newly built and unit-tested but **not yet verified on
-real hardware** — see [docs/PROPOSAL-force-audio-jack.md](docs/PROPOSAL-force-audio-jack.md)
-for exactly what's implemented vs. still pending. This document is the
-install/usage manual for the stable In-bus tap. For internals and the
-full technical design, see [DESIGN.md](DESIGN.md).
+and Skipback are built, unit-tested, and now verified live on real
+hardware too (2026-09-23) — In-bus→Skipback with real, clean audio;
+Out-bus confirmed reaching the right channels at the right rate
+numerically, but not yet confirmed by ear on the physical jacks. See
+[docs/HANDOFF-force-audio-jack.md](docs/HANDOFF-force-audio-jack.md)
+for the current punch list of what's left before a release, and
+[docs/PROPOSAL-force-audio-jack.md](docs/PROPOSAL-force-audio-jack.md)
+for the original design. This document is the install/usage manual for
+the stable In-bus tap. For internals and the full technical design, see
+[DESIGN.md](DESIGN.md).
 
 ---
 
@@ -288,6 +293,7 @@ ssh root@<force-ip> 'tail -f /tmp/forceAudioJack.log'
 DESIGN.md                       technical design & architecture reference (the stable In-bus tap)
 docs/
   PROPOSAL-force-audio-jack.md  design + build-order status for Out-bus/Skipback (in progress)
+  HANDOFF-force-audio-jack.md   current punch list of open items before a release
 src/
   forceAudioJack.c              the interposer: readi hook (In-bus) + writei hook (Out-bus, Skipback extraction)
   forceAudioInject.h            In/Out-bus ring layout - the producer/consumer ABI contract
