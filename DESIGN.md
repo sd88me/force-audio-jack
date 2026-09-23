@@ -552,6 +552,25 @@ either, which is the mistake that cost this project several days.
   placeholder (a genuine no-op, so low risk, but not free). A permanent
   combo needs deciding, and ForceShadow's binding restored or
   deliberately reassigned.
+- **`injectTone`'s producer loop had a real pacing bug, fixed
+  2026-09-23**: it slept the full block-equivalent real-time duration
+  after every write, pacing at exactly 1x real-time with zero margin.
+  An ordinary `nanosleep` overshoot — the norm, not the exception, on a
+  non-realtime-scheduled thread — made it fall a little behind on every
+  iteration with no way to catch back up, producing a steady ~5-6
+  underruns/sec (confirmed load-independent) — each one a real, audible
+  128-sample silence gap. This is exactly what a user listening to a
+  Skipback capture heard as "glitchy or choppy." Fixed by sleeping 80% of
+  the block duration instead of 100%, giving a small self-correcting
+  margin without unbounded bursting (a first attempt that removed pacing
+  entirely was wrong — see `src/injectTone.c`'s comments — the producer
+  ran far faster than real-time and the consumer's own trim logic
+  discarded almost everything it produced). Verified: 0 underruns
+  sustained over 30+ seconds post-fix, versus the previous steady ~5-6/s.
+  Numeric-only verification (RMS + zero-crossing frequency) had missed
+  this; only the user actually listening caught it. Any future audio
+  verification here should also scan for sample-to-sample discontinuities
+  and runs of exact zero, not just RMS/frequency.
 
 ## Building a new voice producer
 
