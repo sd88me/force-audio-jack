@@ -560,17 +560,32 @@ either, which is the mistake that cost this project several days.
   iteration with no way to catch back up, producing a steady ~5-6
   underruns/sec (confirmed load-independent) — each one a real, audible
   128-sample silence gap. This is exactly what a user listening to a
-  Skipback capture heard as "glitchy or choppy." Fixed by sleeping 80% of
-  the block duration instead of 100%, giving a small self-correcting
-  margin without unbounded bursting (a first attempt that removed pacing
-  entirely was wrong — see `src/injectTone.c`'s comments — the producer
-  ran far faster than real-time and the consumer's own trim logic
-  discarded almost everything it produced). Verified: 0 underruns
-  sustained over 30+ seconds post-fix, versus the previous steady ~5-6/s.
-  Numeric-only verification (RMS + zero-crossing frequency) had missed
-  this; only the user actually listening caught it. Any future audio
-  verification here should also scan for sample-to-sample discontinuities
-  and runs of exact zero, not just RMS/frequency.
+  Skipback capture heard as "glitchy or choppy." Fixed by sleeping 96% of
+  the block duration instead of 100% (calibrated from the measured ~1.6%
+  drift, not a round number — an intermediate 80% attempt overproduced at
+  ~1.25x real-time instead of adding a small margin, trading silence gaps
+  for large periodic phase-jump clicks instead). Numeric-only verification
+  (RMS + zero-crossing frequency) had missed this entirely; only the user
+  actually listening caught it. Any future audio verification here should
+  also scan for sample-to-sample discontinuities and runs of exact zero,
+  not just RMS/frequency.
+- **Parked for future refinement, same category as the ring-backlog
+  aliasing bug and the `SCHED_FIFO` note above**: the calibrated 96%
+  margin above eliminates underruns and the associated silence gaps, but
+  a small residual of **~7 tiny phase-discontinuity clicks per 30
+  seconds** remains (evenly spaced, ~4s apart) — the ring still
+  occasionally touches its trim trigger and takes a small corrective
+  jump. Confirmed via `readelf`/diagnostics-grade analysis on a real
+  routed capture (2026-09-23), not just theory. Tightening the margin
+  further hits a real ceiling on this target: `tv_nsec` is a 32-bit
+  `long` on `arm-linux-gnueabihf`, and a finer fraction (985/1000 was
+  tried) overflows the intermediate multiply and silently produces a
+  far-too-short sleep — caught before deployment, but it means going
+  tighter needs a 64-bit intermediate or a different pacing strategy
+  entirely (e.g. tracking a running deadline instead of a fixed
+  per-block sleep fraction), not just a smaller fraction. Low priority:
+  this is `injectTone`'s own test-tone pacing, not the tap's mixing code,
+  and the residual is far smaller than what prompted the investigation.
 
 ## Building a new voice producer
 
