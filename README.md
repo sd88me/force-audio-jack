@@ -1,3 +1,7 @@
+> **Moved:** force-audio-jack is now part of **[Force Shadow](https://github.com/sd88me/force-shadow)** as its audio layer
+> (`audio/` in that repo, full history kept). Install Force Shadow instead: one add-on arms both
+> the visual and audio layers. This repo is archived.
+
 # force-audio-jack
 
 **A shared audio tap for the Akai Force — the prerequisite add-on that
