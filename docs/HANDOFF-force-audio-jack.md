@@ -88,16 +88,23 @@ either restored or deliberately reassigned for good.
 ### 2.7 No automated regression test for §2.1
 Pending a safe way to reproduce the restart-while-attached failure on demand.
 
-### 2.8 Crate Digger's real-content playback — blocked, different addon, flagged not fixed
-`ForceCrateDigger`'s Discogs search genuinely works, but playback (yt-dlp →
-ffmpeg → In-bus) fails because **the device's Python has no `zlib` at all** —
-confirmed on both the bundled `AddOns/Python/python3.8` and the system
-`/usr/bin/python3`, and there is no `libz.so*` anywhere on the filesystem.
-`bz2`/`lzma` are likewise absent; `ssl` works. Fixing this means cross-compiling
-zlib from source into a `_zlib.cpython-38-arm-linux-gnueabihf.so` extension (no
-system libz to link against) — a real side-project, not attempted. This is a
-different addon's dependency, not a force-audio-jack bug — only relevant here
-because it blocked using Crate Digger as a real-content test source for Skipback.
+### 2.8 Crate Digger's real-content playback — FIXED (different repo)
+`ForceCrateDigger`'s SEARCH was blocked by the device's Python having no
+`zlib` module at all, so yt-dlp refused to even start. **Fixed 2026-09-23** in
+the `force-cratedigger` repo (commit `c2c19e1`): `scripts/build-pyzlib.sh`
+builds a private, self-contained `zlib.cpython-38-arm-linux-gnueabihf.so`
+(real zlib 1.3.1 source, statically linked, no device dependency) bundled into
+`bin/pylib/`, loaded via `PYTHONPATH` before the yt-dlp daemon spawns — no
+device-wide Python change. Verified live through the real deployed
+`cratedigger_host` binary: SEARCH now returns real results for `yt`,
+`archive`, and `sc` (SoundCloud). See
+`~/.claude/projects/-home-sam-force-audioin/memory/force_cratedigger_missing_zlib_fixed.md`
+for the full story. **Still open, separately**: the DOWNLOAD path has its own,
+provider-specific issues unrelated to zlib (YouTube's known no-`deno`
+signature-cipher weakness; one SoundCloud stream failing inside `ffmpeg`) —
+not yet root-caused. This is still a different addon's own code, not a
+force-audio-jack bug — only relevant here because it blocks using Crate
+Digger as a real-content test source for Skipback.
 
 ### 2.9 DrmVncServer display race — recurred a 3rd time, trigger still unknown
 Unrelated to force-audio-jack, but happened mid-session on 2026-09-23 with the
