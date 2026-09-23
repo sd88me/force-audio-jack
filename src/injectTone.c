@@ -161,13 +161,34 @@ int main(int argc, char **argv)
             (void)reported;
         }
 
-        /* Sleep for 80% of the block's real-time duration, not 100% - see
+        /* Sleep for 96% of the block's real-time duration, not 100% - see
          * the comment above the space check for why full-duration pacing
          * (the original bug) and no pacing at all (an intermediate, wrong
-         * fix) both fail. This margin is deliberately generous: even a few
-         * ms of scheduling jitter per block is smaller than the 20% margin
-         * at BLOCK_FRAMES=256 (5.8ms/block, so ~1.2ms of slack per block). */
-        struct timespec margin_sleep = { 0, block_time.tv_nsec * 4 / 5 };
+         * fix) both fail. The margin here is deliberately SMALL, not
+         * generous: the original 100%-pacing bug measured out to roughly a
+         * 1.6-1.7% average shortfall (~5-6 underrun events/sec, each one
+         * a ~128-frame/2.9ms deficit) - a 4% margin comfortably covers
+         * that with headroom to spare. An earlier attempt used a 20%
+         * margin (80% sleep), which "worked" in that underruns went to
+         * zero, but overproduced audio at roughly 1.25x real-time -
+         * enough to repeatedly slam into AI_LATENCY_TRIGGER_FRAMES every
+         * ~0.4s and force a large, audible phase-discontinuity trim each
+         * time (confirmed: 63 detected glitches in a 30s capture, just a
+         * different symptom - clicks instead of silence - from the same
+         * over-correction). Match the margin to the measured drift, don't
+         * just pick a comfortable-looking round number.
+         *
+         * NOTE for anyone tightening this further: `tv_nsec` is a 32-bit
+         * `long` on this arm-linux-gnueabihf target, and block_time.tv_nsec
+         * is ~5.8M here (BLOCK_FRAMES/GEN_RATE). A finer-grained fraction
+         * like *985/1000 overflows that 32-bit multiply (5.8M * 985 ~=
+         * 5.7 billion, past INT32_MAX) and silently wraps to a much
+         * smaller value - the sleep becomes far too SHORT, not too long,
+         * so the symptom looks like "overproducing again" (confirmed: this
+         * exact mistake was made and caught here on 2026-09-23). Keep the
+         * multiplier under roughly 370 with this block size, or widen the
+         * intermediate to a 64-bit type before multiplying. */
+        struct timespec margin_sleep = { 0, block_time.tv_nsec * 96 / 100 };
         nanosleep(&margin_sleep, NULL);
     }
 
